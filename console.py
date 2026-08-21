@@ -97,9 +97,9 @@ def main():
     wasi_config.inherit_stdout()
     wasi_config.inherit_stderr() 
     
-    try:
+    try:        
         # Map the folder containing the .wasm file to the root '/' in the guest
-        wasi_config.preopen_dir(cart_dir, "/")
+        wasi_config.preopen_dir(cart_dir, "/", wasmtime.DirPerms.READ_ONLY, wasmtime.FilePerms.READ_ONLY)
     except wasmtime.WasmtimeError as e:
         print(f"Failed to map directory {cart_dir} to WASI root: {e}")
         sys.exit(1)
