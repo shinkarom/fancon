@@ -18,45 +18,54 @@ SAMPLE_RATE = 44100
 CHANNELS = 2
 
 # ==========================================
+# INPUT SUBSYSTEM (HARDWARE SCANCODES)
+# ==========================================
+# These integers map to the physical QWERTY key locations across all OSes and layouts.
+SCANCODE_MAP = {
+    82: 1,      # UP ARROW
+    81: 2,      # DOWN ARROW
+    80: 4,      # LEFT ARROW
+    79: 8,      # RIGHT ARROW
+    27: 16,     # X (A button - Physical bottom row)
+    29: 32,     # Z (B button - Physical bottom row)
+    22: 64,     # S (X button - Physical middle row)
+    4:  128,    # A (Y button - Physical middle row)
+    40: 256,    # RETURN (Start)
+    229: 512,   # RIGHT SHIFT (Select)
+    20: 1024,   # Q (L Bumper - Physical top row)
+    26: 2048    # W (R Bumper - Physical top row)
+}
+
+# ==========================================
 # AUDIO SUBSYSTEM
 # ==========================================
 class AudioRingBuffer:
     """A true streaming buffer to handle arbitrary chunk sizes safely."""
-    def __init__(self, max_bytes=44100 * 4): # Max 1 second of audio buffered (44100 samples * 4 bytes)
+    def __init__(self, max_bytes=44100 * 4): 
         self.lock = threading.Lock()
         self.buffer = bytearray()
         self.max_bytes = max_bytes
 
     def write(self, pcm_bytes):
         with self.lock:
-            # Prevent infinite memory growth if audio thread stalls
             if len(self.buffer) < self.max_bytes:
                 self.buffer.extend(pcm_bytes)
 
     def read_generator(self):
         """Infinite generator consumed by the miniaudio background thread."""
-        
-        # 1. This first yield pauses the generator so it is no longer "just-started".
-        # When miniaudio calls .send(framecount) for the first time, it resumes here.
         frames_requested = yield b"" 
         
         while True:
-            # 1 frame = 2 channels * 2 bytes (16-bit audio) = 4 bytes
             bytes_needed = frames_requested * 4 
-            
             with self.lock:
                 if len(self.buffer) >= bytes_needed:
-                    # We have enough audio! Slice it off the front.
                     chunk = bytes(self.buffer[:bytes_needed])
                     del self.buffer[:bytes_needed]
                 else:
-                    # Buffer underrun: drain what we have, pad the rest with silence
                     chunk = bytes(self.buffer) + b'\x00' * (bytes_needed - len(self.buffer))
                     self.buffer.clear()
             
-            # 2. Yield the audio to miniaudio, and receive the next frame request
             frames_requested = yield chunk
-
 
 # ==========================================
 # VIDEO SUBSYSTEM
@@ -92,14 +101,18 @@ def main():
     linker = wasmtime.Linker(engine)
     linker.define_wasi()
     
-    # Configure WASI to allow printing to host console and reading the cart directory
     wasi_config = wasmtime.WasiConfig()
     wasi_config.inherit_stdout()
     wasi_config.inherit_stderr() 
     
-    try:        
-        # Map the folder containing the .wasm file to the root '/' in the guest
-        wasi_config.preopen_dir(cart_dir, "/", wasmtime.DirPerms.READ_ONLY, wasmtime.FilePerms.READ_ONLY)
+    try:
+        # Securely lock the guest to Read-Only access for the cartridge directory
+        wasi_config.preopen_dir(
+            cart_dir, 
+            "/", 
+            wasmtime.DirPerms.READ_ONLY, 
+            wasmtime.FilePerms.READ_ONLY
+        )
     except wasmtime.WasmtimeError as e:
         print(f"Failed to map directory {cart_dir} to WASI root: {e}")
         sys.exit(1)
@@ -107,32 +120,45 @@ def main():
     store = wasmtime.Store(engine)
     store.set_wasi(wasi_config)
     
+    # ----------------------------------------------------
+    # HOST API: Inject custom Python functions into WASM
+    # ----------------------------------------------------
+    input_state = {"pressed": 0, "just_pressed": 0, "just_released": 0}
+
+    def host_get_btn_pressed():
+        return input_state["pressed"]
+
+    def host_get_btn_just_pressed():
+        return input_state["just_pressed"]
+
+    def host_get_btn_just_released():
+        return input_state["just_released"]
+
+    sig_return_i32 = wasmtime.FuncType([], [wasmtime.ValType.i32()])
+
+    linker.define_func("env", "get_btn_pressed", sig_return_i32, host_get_btn_pressed)
+    linker.define_func("env", "get_btn_just_pressed", sig_return_i32, host_get_btn_just_pressed)
+    linker.define_func("env", "get_btn_just_released", sig_return_i32, host_get_btn_just_released)
+    # ----------------------------------------------------
+
     try:
         module = wasmtime.Module.from_file(engine, cart_path)
         instance = linker.instantiate(store, module)
         exports = instance.exports(store)
         
-        # Required WASM Exports
         wasm_memory = exports["memory"]
         wasm_update = exports["update"]
         wasm_draw = exports["draw"]
         get_framebuffer_ptr = exports["get_framebuffer_ptr"]
         
-        # Standard WASI Reactor initialization (if exported by compiler)
         if "_initialize" in exports:
             exports["_initialize"](store)
             
-        # Custom user initialization
         if "init" in exports:
             exports["init"](store)
             
     except Exception as e:
         print(f"Failed to load or instantiate '{cart_path}':\n{e}")
-        print("\nEnsure your WASM file exports:")
-        print("  - memory")
-        print("  - update()")
-        print("  - draw()")
-        print("  - get_framebuffer_ptr() -> returns a pointer")
         sys.exit(1)
 
     # 3. INITIALIZE AUDIO
@@ -143,11 +169,8 @@ def main():
         sample_rate=SAMPLE_RATE
     )
     
-    # Create the generator instance
     audio_gen = ring_buffer.read_generator()
-    # Prime the generator strictly (Advances it to the first yield)
     audio_gen.send(None) 
-    # Start the device with the primed generator
     audio_device.start(audio_gen)
 
     # 4. INITIALIZE PYGAME (HOST DISPLAY)
@@ -155,41 +178,53 @@ def main():
     pygame.font.init() 
     sys_font = pygame.font.SysFont(None, 36) 
     
-    # Get the user's native monitor resolution
     info = pygame.display.Info()
     monitor_w = info.current_w
     monitor_h = info.current_h
 
     # Force Fullscreen, Double Buffering, and VSync
     flags = pygame.FULLSCREEN | pygame.DOUBLEBUF
-    # Passing (0, 0) tells Pygame to take over the whole monitor
     screen = pygame.display.set_mode((0, 0), flags, vsync=1)
     
     clock = pygame.time.Clock()
-    
-    # Calculate the perfect letterbox for this specific monitor
     scaled_size, offset = calculate_letterbox(monitor_w, monitor_h)
 
     show_fps = True
+    prev_btn_mask = 0
 
     # 5. MAIN EXECUTION LOOP
     running = True
+    current_btn_mask = 0
+    prev_btn_mask = 0
+
     while running:
         # --- EVENT HANDLING ---
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
                 
-            elif event.type == pygame.VIDEORESIZE:
-                window_size = (event.w, event.h)
-                scaled_size, offset = calculate_letterbox(window_size[0], window_size[1])
-                
             elif event.type == pygame.KEYDOWN:
+                # 1. Handle System Keys (We use event.key here because Escape/F11 are universal)
                 if event.key == pygame.K_ESCAPE:      
-                    running = False
+                    running = False 
                 elif event.key == pygame.K_F11:       
-                    # Toggle the FPS overlay instead of fullscreen
                     show_fps = not show_fps
+                
+                # 2. Handle Game Input (Using hardware scancodes)
+                if event.scancode in SCANCODE_MAP:
+                    current_btn_mask |= SCANCODE_MAP[event.scancode]
+                    
+            elif event.type == pygame.KEYUP:
+                # 3. Handle Game Input Release
+                if event.scancode in SCANCODE_MAP:
+                    current_btn_mask &= ~SCANCODE_MAP[event.scancode]
+
+        # --- CALCULATE INPUT STATES ---
+        input_state["just_pressed"] = current_btn_mask & ~prev_btn_mask
+        input_state["just_released"] = ~current_btn_mask & prev_btn_mask
+        input_state["pressed"] = current_btn_mask
+        
+        prev_btn_mask = current_btn_mask
 
         # --- UPDATE & DRAW GUEST ---
         wasm_update(store)
@@ -216,18 +251,12 @@ def main():
         screen.blit(scaled_fb, offset)
         
         # --- RENDER FPS OVERLAY ---
-        fps = clock.get_fps()
-        pygame.display.set_caption(f"Arcade Core - {os.path.basename(cart_path)}")
-        
         if show_fps:
-            # Draw yellow text with black background block for high contrast
+            fps = clock.get_fps()
             fps_text = sys_font.render(f" FPS: {fps:.1f} ", True, (255, 255, 0), (0, 0, 0))
             
-            # Position it safely inside the game screen (Top-Right corner)
-            # offset[0] is the left black bar, scaled_size[0] is the game width
             safe_x = offset[0] + scaled_size[0] - fps_text.get_width() - 20
             safe_y = offset[1] + 20
-            
             screen.blit(fps_text, (safe_x, safe_y))
         
         pygame.display.flip()

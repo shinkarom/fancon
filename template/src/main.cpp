@@ -9,27 +9,54 @@
 #define WIDTH 480
 #define HEIGHT 270
 
-// --- VIDEO & AUDIO ---
+// ==========================================
+// AUDIO & VIDEO BUFFERS
+// ==========================================
 uint8_t framebuffer[WIDTH * HEIGHT * 4];
+
 const int SAMPLE_RATE = 44100;
 const int AUDIO_FRAMES_PER_TICK = 735; 
 int16_t audio_buffer[AUDIO_FRAMES_PER_TICK * 2];
 float audio_phase = 0.0f;
 
-// --- GAME STATE ---
-float box_x = 100.0f;
-float box_y = 100.0f;
-float vel_x = 4.0f; 
-float vel_y = 3.0f; 
+// ==========================================
+// GAME STATE
+// ==========================================
+float box_x = 220.0f; // Start roughly in the center
+float box_y = 115.0f;
+float speed = 4.0f; 
 const int BOX_SIZE = 40;
+uint8_t box_r = 255; // Red color channel (toggled by 'A' button)
 
-// --- CONTAINERS (Proves dynamic memory/heap works) ---
-struct Point {
-    int x, y;
-};
+struct Point { int x, y; };
 std::vector<Point> trail;
-std::string file_message = "No message loaded.";
 
+// BUTTON MASKS (Must match Python Host)
+const uint32_t BTN_UP    = 1;
+const uint32_t BTN_DOWN  = 2;
+const uint32_t BTN_LEFT  = 4;
+const uint32_t BTN_RIGHT = 8;
+const uint32_t BTN_A     = 16;
+const uint32_t BTN_B     = 32;
+
+// ==========================================
+// HOST API IMPORTS (The "Pull" Model)
+// ==========================================
+extern "C" {
+    // These tell the compiler: Python will provide these functions at runtime!
+    __attribute__((import_module("env"), import_name("get_btn_pressed")))
+    uint32_t get_btn_pressed();
+
+    __attribute__((import_module("env"), import_name("get_btn_just_pressed")))
+    uint32_t get_btn_just_pressed();
+
+    __attribute__((import_module("env"), import_name("get_btn_just_released")))
+    uint32_t get_btn_just_released();
+}
+
+// ==========================================
+// CARTRIDGE EXPORTS (Called by Host)
+// ==========================================
 extern "C" {
 
     __attribute__((export_name("get_framebuffer_ptr")))
@@ -41,53 +68,66 @@ extern "C" {
     __attribute__((export_name("get_audio_size")))
     int get_audio_size() { return AUDIO_FRAMES_PER_TICK * 2 * sizeof(int16_t); }
 
-    // --- LIFECYCLE ---
     __attribute__((export_name("init")))
     void init() {
         printf("\n--- WASM C++ INITIALIZATION ---\n");
 
         // 1. PROVE CONTAINERS WORK
-        trail.reserve(50); // Pre-allocate heap memory
+        trail.reserve(50);
         printf("[OK] std::vector heap allocation successful.\n");
 
-        // 2. PROVE FILESYSTEM WORKS
-        // Because Python mapped the cart's folder to "/", we look for "/hello.txt"
+        // 2. PROVE FILESYSTEM WORKS (Read-Only)
         std::ifstream file("/hello.txt");
+        std::string file_message = "";
         
         if (file.is_open()) {
-            // Read the first line of the file into our std::string container
             std::getline(file, file_message);
             printf("[OK] File loaded successfully!\n");
             printf("     Contents: \"%s\"\n", file_message.c_str());
             file.close();
         } else {
             printf("[FAIL] Could not open /hello.txt\n");
-            printf("       Make sure hello.txt is in the same folder as cart.wasm!\n");
         }
         
-        printf("-------------------------------\n\n");
+        printf("-------------------------------\n");
+        printf("Controls: Arrow Keys to move, 'X' key (A Button) to change color.\n\n");
     }
 
     __attribute__((export_name("update")))
     void update() {
-        // 1. Record current position into the vector container
+        // 1. PULL INPUTS FROM THE HOST
+        uint32_t pressed = get_btn_pressed();
+        uint32_t just_pressed = get_btn_just_pressed();
+        uint32_t just_released = get_btn_just_released();
+
+        // 2. RECORD TRAIL
         trail.push_back({(int)box_x, (int)box_y});
-        
-        // Keep only the last 40 positions in the vector
-        if (trail.size() > 40) {
-            trail.erase(trail.begin()); 
+        if (trail.size() > 40) trail.erase(trail.begin()); 
+
+        // 3. CONTINUOUS MOVEMENT
+        if (pressed & BTN_LEFT)  box_x -= speed;
+        if (pressed & BTN_RIGHT) box_x += speed;
+        if (pressed & BTN_UP)    box_y -= speed;
+        if (pressed & BTN_DOWN)  box_y += speed;
+
+        // Keep box clamped to the screen
+        if (box_x < 0) box_x = 0;
+        if (box_x > WIDTH - BOX_SIZE) box_x = WIDTH - BOX_SIZE;
+        if (box_y < 0) box_y = 0;
+        if (box_y > HEIGHT - BOX_SIZE) box_y = HEIGHT - BOX_SIZE;
+
+        // 4. SINGLE ACTIONS (Triggered once per tap)
+        if (just_pressed & BTN_A) {
+            box_r = (box_r == 255) ? 0 : 255; // Toggle red channel
+            printf("A Button Just Pressed!\n");
         }
 
-        // 2. Move the box
-        box_x += vel_x;
-        box_y += vel_y;
+        if (just_released & BTN_B) {
+            printf("B Button Just Released!\n");
+        }
 
-        if (box_x <= 0 || box_x + BOX_SIZE >= WIDTH) vel_x = -vel_x;
-        if (box_y <= 0 || box_y + BOX_SIZE >= HEIGHT) vel_y = -vel_y;
-
-        // 3. Audio (unchanged)
-        float base_freq = 200.0f; 
-        float freq = base_freq + box_x; 
+        // 5. GENERATE AUDIO (Pitch linked to X position)
+        float freq = 200.0f + box_x; 
         float phase_inc = (2.0f * 3.14159265f * freq) / SAMPLE_RATE;
 
         for (int i = 0; i < AUDIO_FRAMES_PER_TICK; ++i) {
@@ -103,54 +143,40 @@ extern "C" {
     void draw() {
         // Clear screen to dark purple
         for (int i = 0; i < WIDTH * HEIGHT * 4; i += 4) {
-            framebuffer[i + 0] = 30; 
-            framebuffer[i + 1] = 10; 
-            framebuffer[i + 2] = 40; 
-            framebuffer[i + 3] = 255;
+            framebuffer[i + 0] = 30;  // R
+            framebuffer[i + 1] = 10;  // G
+            framebuffer[i + 2] = 40;  // B
+            framebuffer[i + 3] = 255; // A
         }
 
-        // --- DRAW THE C++ CONTAINER TRAIL ---
-        // Iterate through our std::vector and draw a fading trail
+        // Draw the fading trail
         for (size_t i = 0; i < trail.size(); ++i) {
             int tx = trail[i].x;
             int ty = trail[i].y;
-            
-            // Calculate a fading color based on position in the vector
-            uint8_t color_intensity = (uint8_t)((float)i / trail.size() * 255.0f);
+            uint8_t alpha = (uint8_t)((float)i / trail.size() * 255.0f);
 
-            // Draw a smaller box for the trail
             for (int y = 10; y < BOX_SIZE - 10; ++y) {
                 for (int x = 10; x < BOX_SIZE - 10; ++x) {
-                    int px = tx + x;
-                    int py = ty + y;
-                    
-                    if (px >= 0 && px < WIDTH && py >= 0 && py < HEIGHT) {
-                        int index = (py * WIDTH + px) * 4;
-                        framebuffer[index + 0] = color_intensity; // R
-                        framebuffer[index + 1] = 0;               // G
-                        framebuffer[index + 2] = 100;             // B
-                        framebuffer[index + 3] = 255;             // A
-                    }
+                    int index = ((ty + y) * WIDTH + (tx + x)) * 4;
+                    framebuffer[index + 0] = box_r; 
+                    framebuffer[index + 1] = 0;               
+                    framebuffer[index + 2] = 100;             
+                    framebuffer[index + 3] = alpha;           
                 }
             }
         }
 
-        // --- DRAW THE MAIN BOX ---
+        // Draw the main interactive box
         int bx = (int)box_x;
         int by = (int)box_y;
 
         for (int y = 0; y < BOX_SIZE; ++y) {
             for (int x = 0; x < BOX_SIZE; ++x) {
-                int px = bx + x;
-                int py = by + y;
-                
-                if (px >= 0 && px < WIDTH && py >= 0 && py < HEIGHT) {
-                    int index = (py * WIDTH + px) * 4;
-                    framebuffer[index + 0] = 255; 
-                    framebuffer[index + 1] = 128; 
-                    framebuffer[index + 2] = 0;   
-                    framebuffer[index + 3] = 255; 
-                }
+                int index = ((by + y) * WIDTH + (bx + x)) * 4;
+                framebuffer[index + 0] = box_r; 
+                framebuffer[index + 1] = 128; 
+                framebuffer[index + 2] = 0;   
+                framebuffer[index + 3] = 255; 
             }
         }
     }
