@@ -155,14 +155,21 @@ def main():
     pygame.font.init() 
     sys_font = pygame.font.SysFont(None, 36) 
     
-    window_size = (RES_W * 3, RES_H * 3) # Default to 3x scale (1440x810)
-    flags = pygame.RESIZABLE | pygame.DOUBLEBUF
-    screen = pygame.display.set_mode(window_size, flags, vsync=1)
+    # Get the user's native monitor resolution
+    info = pygame.display.Info()
+    monitor_w = info.current_w
+    monitor_h = info.current_h
+
+    # Force Fullscreen, Double Buffering, and VSync
+    flags = pygame.FULLSCREEN | pygame.DOUBLEBUF
+    # Passing (0, 0) tells Pygame to take over the whole monitor
+    screen = pygame.display.set_mode((0, 0), flags, vsync=1)
     
     clock = pygame.time.Clock()
-    scaled_size, offset = calculate_letterbox(window_size[0], window_size[1])
+    
+    # Calculate the perfect letterbox for this specific monitor
+    scaled_size, offset = calculate_letterbox(monitor_w, monitor_h)
 
-    # State for the FPS overlay
     show_fps = True
 
     # 5. MAIN EXECUTION LOOP
