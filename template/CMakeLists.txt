@@ -9,15 +9,31 @@ set(CMAKE_CXX_COMPILER wasm32-wasip1-clang++)
 
 project(FantasyCartridge CXX C)
 
-set(CMAKE_CXX_STANDARD 17)
+# Set a default build type to "Debug" if none is specified
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Debug CACHE STRING "Choose the type of build." FORCE)
+endif()
+
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_link_options(-mexec-model=reactor)
 
 add_executable(cart src/main.cpp)
-
 set_target_properties(cart PROPERTIES SUFFIX ".wasm")
 
-# 2. FIX THE ERROR: Add -fno-exceptions so std::vector doesn't try to use cxa_throw
-target_compile_options(cart PRIVATE -O3 -flto -fno-exceptions)
-target_link_options(cart PRIVATE -O3 -flto -fno-exceptions)
+# ==========================================
+# COMPILER / LINKER FLAGS
+# ==========================================
+
+# 1. Base flags for ALL builds (Required for WASM)
+target_compile_options(cart PRIVATE -fno-exceptions)
+target_link_options(cart PRIVATE -fno-exceptions)
+
+# 2. Debug Build: Fast compile times, includes debugging symbols (-g)
+# Note: Using -O1 instead of -O0 so the game still runs at a playable framerate.
+target_compile_options(cart PRIVATE $<$<CONFIG:Debug>:-O1 -g>)
+
+# 3. Release Build: Slow compile times, maximum optimization
+target_compile_options(cart PRIVATE $<$<CONFIG:Release>:-O3 -flto>)
+target_link_options(cart PRIVATE $<$<CONFIG:Release>:-O3 -flto>)
