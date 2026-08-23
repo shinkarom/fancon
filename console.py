@@ -20,12 +20,21 @@ FPS = 60
 AUDIO_BYTES_PER_TICK = int((SAMPLE_RATE / FPS) * CHANNELS * 2)
 
 # ==========================================
-# INPUT SUBSYSTEM (GLFW Key Mappings)
+# INPUT SUBSYSTEM
 # ==========================================
 KEY_MAP = {
     glfw.KEY_UP: 1, glfw.KEY_DOWN: 2, glfw.KEY_LEFT: 4, glfw.KEY_RIGHT: 8,
     glfw.KEY_X: 16, glfw.KEY_Z: 32, glfw.KEY_S: 64, glfw.KEY_A: 128,
     glfw.KEY_ENTER: 256, glfw.KEY_RIGHT_SHIFT: 512, glfw.KEY_Q: 1024, glfw.KEY_W: 2048
+}
+
+GAMEPAD_MAP = {
+    glfw.GAMEPAD_BUTTON_DPAD_UP: 1, glfw.GAMEPAD_BUTTON_DPAD_DOWN: 2, 
+    glfw.GAMEPAD_BUTTON_DPAD_LEFT: 4, glfw.GAMEPAD_BUTTON_DPAD_RIGHT: 8,
+    glfw.GAMEPAD_BUTTON_A: 16, glfw.GAMEPAD_BUTTON_B: 32, 
+    glfw.GAMEPAD_BUTTON_X: 64, glfw.GAMEPAD_BUTTON_Y: 128,
+    glfw.GAMEPAD_BUTTON_START: 256, glfw.GAMEPAD_BUTTON_BACK: 512, 
+    glfw.GAMEPAD_BUTTON_LEFT_BUMPER: 1024, glfw.GAMEPAD_BUTTON_RIGHT_BUMPER: 2048
 }
 
 class AudioRingBuffer:
@@ -59,6 +68,26 @@ def calculate_letterbox(win_w, win_h, res_w, res_h):
     offset_x = (win_w - new_w) / 2
     offset_y = (win_h - new_h) / 2
     return skia.Rect.MakeXYWH(offset_x, offset_y, new_w, new_h)
+
+def poll_gamepad():
+    """Polls GLFW Joystick 1 and maps it to our bitmask."""
+    gamepad_mask = 0
+    if glfw.joystick_present(glfw.JOYSTICK_1) and glfw.joystick_is_gamepad(glfw.JOYSTICK_1):
+        state = glfw.get_gamepad_state(glfw.JOYSTICK_1)
+        if state:
+            # Map Buttons
+            for btn, bitmask in GAMEPAD_MAP.items():
+                if state.buttons[btn] == glfw.PRESS:
+                    gamepad_mask |= bitmask
+            
+            # Map Left Analog Stick to D-Pad (with 0.5 deadzone)
+            deadzone = 0.5
+            if state.axes[glfw.GAMEPAD_AXIS_LEFT_Y] < -deadzone: gamepad_mask |= 1 # UP
+            if state.axes[glfw.GAMEPAD_AXIS_LEFT_Y] > deadzone: gamepad_mask |= 2  # DOWN
+            if state.axes[glfw.GAMEPAD_AXIS_LEFT_X] < -deadzone: gamepad_mask |= 4 # LEFT
+            if state.axes[glfw.GAMEPAD_AXIS_LEFT_X] > deadzone: gamepad_mask |= 8  # RIGHT
+
+    return gamepad_mask
 
 def main():
     parser = argparse.ArgumentParser(description="Pure Skia Fantasy Console")
@@ -155,19 +184,19 @@ def main():
     paint_fps = skia.Paint(Color=skia.ColorYELLOW, AntiAlias=True)
 
     show_fps = True
-    current_btn_mask = 0
+    keyboard_btn_mask = 0
     prev_btn_mask = 0
 
     def key_callback(win, key, scancode, action, mods):
-        nonlocal current_btn_mask, show_fps
+        nonlocal keyboard_btn_mask, show_fps
         if key == glfw.KEY_ESCAPE and action == glfw.PRESS:
             glfw.set_window_should_close(win, True)
         elif key == glfw.KEY_F11 and action == glfw.PRESS:
             show_fps = not show_fps
             
         if key in KEY_MAP:
-            if action == glfw.PRESS: current_btn_mask |= KEY_MAP[key]
-            elif action == glfw.RELEASE: current_btn_mask &= ~KEY_MAP[key]
+            if action == glfw.PRESS: keyboard_btn_mask |= KEY_MAP[key]
+            elif action == glfw.RELEASE: keyboard_btn_mask &= ~KEY_MAP[key]
 
     glfw.set_key_callback(window, key_callback)
 
@@ -180,6 +209,10 @@ def main():
     # ==========================================
     while not glfw.window_should_close(window):
         glfw.poll_events()
+
+        # Combine Keyboard and Gamepad states!
+        gamepad_btn_mask = poll_gamepad()
+        current_btn_mask = keyboard_btn_mask | gamepad_btn_mask
 
         input_state["just_pressed"] = current_btn_mask & ~prev_btn_mask
         input_state["just_released"] = ~current_btn_mask & prev_btn_mask
