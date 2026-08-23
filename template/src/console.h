@@ -40,8 +40,8 @@ extern "C" {
     WASM_IMPORT("env", "set_screen_res")        void set_screen_res(int width, int height);
 
     // Exports
-    WASM_EXPORT("get_framebuffer_ptr") uint32_t* get_framebuffer_ptr() { return framebuffer; }
-    WASM_EXPORT("get_audio_ptr")       int16_t*  get_audio_ptr() { return audio_buffer; }
+    WASM_EXPORT("get_framebuffer_ptr") inline uint32_t* get_framebuffer_ptr() { return framebuffer; }
+    WASM_EXPORT("get_audio_ptr")       inline int16_t*  get_audio_ptr() { return audio_buffer; }
 
     void init();
     void update();
