@@ -107,7 +107,7 @@ def main():
     wasi_config = wasmtime.WasiConfig()
     wasi_config.inherit_stdout()
     wasi_config.inherit_stderr() 
-    wasi_config.preopen_dir(cart_dir, "/", wasmtime.DirPerms.READ_ONLY, wasmtime.FilePerms.READ_ONLY)
+    #wasi_config.preopen_dir(cart_dir, "/", wasmtime.DirPerms.READ_ONLY, wasmtime.FilePerms.READ_ONLY)
 
     store = wasmtime.Store(engine)
     store.set_wasi(wasi_config)
