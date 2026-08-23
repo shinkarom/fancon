@@ -15,8 +15,11 @@ RES_W = 480
 RES_H = 270
 VRAM_SIZE = RES_W * RES_H * 4  # 4 bytes per pixel (RGBA)
 
+FPS = 60
+
 SAMPLE_RATE = 44100
 CHANNELS = 2
+AUDIO_BYTES_PER_TICK = int((SAMPLE_RATE / FPS) * CHANNELS * 2) 
 
 # ==========================================
 # INPUT SUBSYSTEM (GLFW Key Mappings)
@@ -203,10 +206,9 @@ def main():
         wasm_draw(store)
 
         # Audio Extract
-        if "get_audio_ptr" in exports and "get_audio_size" in exports:
+        if "get_audio_ptr" in exports:
             audio_ptr = exports["get_audio_ptr"](store)
-            audio_size = exports["get_audio_size"](store)
-            raw_audio = wasm_memory.read(store, audio_ptr, audio_ptr + audio_size)
+            raw_audio = wasm_memory.read(store, audio_ptr, audio_ptr + AUDIO_BYTES_PER_TICK)
             ring_buffer.write(raw_audio)
 
         # Video Extract

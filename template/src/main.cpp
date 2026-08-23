@@ -113,44 +113,42 @@ extern "C" {
     }
 
     WASM_EXPORT("draw")
-    void draw() {
-        // 1. Clear screen to dark purple
-        for (int i = 0; i < WIDTH * HEIGHT * 4; i += 4) {
-            framebuffer[i + 0] = 30;  // R
-            framebuffer[i + 1] = 10;  // G
-            framebuffer[i + 2] = 40;  // B
-            framebuffer[i + 3] = 255; // A
-        }
+	void draw() {
+		// Cast the byte array to an array of 32-bit integers
+		uint32_t* fb = (uint32_t*)framebuffer;
 
-        // 2. Draw the fading trail
-        for (size_t i = 0; i < trail.size(); ++i) {
-            int tx = trail[i].x;
-            int ty = trail[i].y;
-            uint8_t alpha = (uint8_t)((float)i / trail.size() * 255.0f);
+		// 1. Clear screen to dark purple (0xFF for 255 Alpha)
+		// 0xFF (A) | 0x28 (B) | 0x0A (G) | 0x1E (R) = 0xFF280A1E
+		uint32_t bg_color = 0xFF280A1E;
+		for (int i = 0; i < WIDTH * HEIGHT; ++i) {
+			fb[i] = bg_color;
+		}
 
-            for (int y = 10; y < BOX_SIZE - 10; ++y) {
-                for (int x = 10; x < BOX_SIZE - 10; ++x) {
-                    int index = ((ty + y) * WIDTH + (tx + x)) * 4;
-                    framebuffer[index + 0] = box_r; 
-                    framebuffer[index + 1] = 0;               
-                    framebuffer[index + 2] = 100;             
-                    framebuffer[index + 3] = alpha;           
-                }
-            }
-        }
+		// 2. Draw the fading trail
+		for (size_t i = 0; i < trail.size(); ++i) {
+			int tx = trail[i].x;
+			int ty = trail[i].y;
+			uint8_t alpha = (uint8_t)((float)i / trail.size() * 255.0f);
+			
+			// Build the 32-bit color: Alpha | Blue(100) | Green(0) | Red(box_r)
+			uint32_t trail_color = (alpha << 24) | (100 << 16) | (0 << 8) | box_r;
 
-        // 3. Draw the main interactive box
-        int bx = (int)box_x;
-        int by = (int)box_y;
+			for (int y = 10; y < BOX_SIZE - 10; ++y) {
+				for (int x = 10; x < BOX_SIZE - 10; ++x) {
+					fb[(ty + y) * WIDTH + (tx + x)] = trail_color;
+				}
+			}
+		}
 
-        for (int y = 0; y < BOX_SIZE; ++y) {
-            for (int x = 0; x < BOX_SIZE; ++x) {
-                int index = ((by + y) * WIDTH + (bx + x)) * 4;
-                framebuffer[index + 0] = box_r; 
-                framebuffer[index + 1] = 128; 
-                framebuffer[index + 2] = 0;   
-                framebuffer[index + 3] = 255; 
-            }
-        }
-    }
+		// 3. Draw the main interactive box
+		int bx = (int)box_x;
+		int by = (int)box_y;
+		uint32_t box_color = (255 << 24) | (0 << 16) | (128 << 8) | box_r;
+
+		for (int y = 0; y < BOX_SIZE; ++y) {
+			for (int x = 0; x < BOX_SIZE; ++x) {
+				fb[(by + y) * WIDTH + (bx + x)] = box_color;
+			}
+		}
+	}
 }

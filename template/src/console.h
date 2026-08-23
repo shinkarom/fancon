@@ -34,7 +34,7 @@ constexpr uint32_t BTN_R      = 2048;   // W (Physical top row)
 // ==========================================
 // SYSTEM BUFFERS
 // ==========================================
-inline uint8_t framebuffer[WIDTH * HEIGHT * 4];
+inline uint32_t framebuffer[WIDTH * HEIGHT];
 inline int16_t audio_buffer[AUDIO_FRAMES_PER_TICK * 2];
 
 // ==========================================
@@ -56,13 +56,10 @@ extern "C" {
 // ==========================================
 extern "C" {
     WASM_EXPORT("get_framebuffer_ptr")
-    uint8_t* get_framebuffer_ptr() { return framebuffer; }
+    uint32_t* get_framebuffer_ptr() { return framebuffer; }
 
     WASM_EXPORT("get_audio_ptr")
     int16_t* get_audio_ptr() { return audio_buffer; }
-
-    WASM_EXPORT("get_audio_size")
-    int get_audio_size() { return AUDIO_FRAMES_PER_TICK * 2 * sizeof(int16_t); }
 
     // Forward declarations - The game developer MUST implement these!
     void init();
