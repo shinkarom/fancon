@@ -1,154 +1,179 @@
 #include "console.h"
-
-#include <cstdio>
 #include <cmath>
-#include <vector>
-#include <string>
-#include <fstream>
-#include <iostream>
+#include <cstdlib>
+
+// ==========================================
+// COLOR PALETTE (0xAABBGGRR)
+// ==========================================
+constexpr uint32_t C_BLACK  = 0xFF000000;
+constexpr uint32_t C_WHITE  = 0xFFFFFFFF;
+constexpr uint32_t C_RED    = 0xFF0000FF;
+constexpr uint32_t C_GREEN  = 0xFF00FF00;
+constexpr uint32_t C_YELLOW = 0xFF00FFFF;
+constexpr uint32_t C_GRAY   = 0xFF444444;
 
 // ==========================================
 // GAME STATE
 // ==========================================
-float box_x = 220.0f; // Start roughly in the center
-float box_y = 115.0f;
-float speed = 4.0f; 
-const int BOX_SIZE = 40;
-uint8_t box_r = 255; // Red color channel (toggled by 'A' button)
+int game_w = 320;
+int game_h = 180;
 
-struct Point { int x, y; };
-std::vector<Point> trail;
+enum GameState { ATTRACT_MODE, PLAYING };
+GameState state = ATTRACT_MODE;
 
-float audio_phase = 0.0f;
+int frame_counter = 0;
+float px = 160.0f;
+float py = 150.0f;
+constexpr float SPEED = 3.0f;
+
+bool b_active = false;
+float bx = 0, by = 0;
+float b_audio_pitch = 0;
+
+struct Star { float x, y, speed; };
+Star stars[50];
 
 // ==========================================
-// GAME LIFECYCLE EXPORTS
+// RENDER HELPERS
+// ==========================================
+void draw_rect(float fx, float fy, int w, int h, uint32_t color) {
+    int start_x = (int)fx;
+    int start_y = (int)fy;
+    
+    for (int y = 0; y < h; ++y) {
+        int py = start_y + y;
+        if (py < 0 || py >= game_h) continue; 
+
+        for (int x = 0; x < w; ++x) {
+            int px = start_x + x;
+            if (px < 0 || px >= game_w) continue; 
+            
+            // Tightly pack the pixels based on current active width
+            framebuffer[py * game_w + px] = color;
+        }
+    }
+}
+
+// ==========================================
+// LIFECYCLE
 // ==========================================
 extern "C" {
-
     WASM_EXPORT("init")
     void init() {
-        printf("\n--- WASM C++ INITIALIZATION ---\n");
+        set_screen_res(game_w, game_h);
 
-        // 1. PROVE CONTAINERS WORK
-        trail.reserve(50);
-        printf("[OK] std::vector heap allocation successful.\n");
-
-        // 2. PROVE FILESYSTEM WORKS (Read-Only via WASI)
-        std::ifstream file("/hello.txt");
-        std::string file_message = "";
-        
-        if (file.is_open()) {
-            std::getline(file, file_message);
-            printf("[OK] File loaded successfully!\n");
-            printf("     Contents: \"%s\"\n", file_message.c_str());
-            file.close();
-        } else {
-            printf("[FAIL] Could not open /hello.txt\n");
+        for (int i = 0; i < 50; ++i) {
+            stars[i].x = (float)(rand() % game_w);
+            stars[i].y = (float)(rand() % game_h);
+            stars[i].speed = ((rand() % 10) / 10.0f) + 0.2f;
         }
-        
-        printf("-------------------------------\n");
-        printf("Controls:\n");
-        printf("  Arrow Keys : Move\n");
-        printf("  Q (L Bumper): Hold to Sprint\n");
-        printf("  X (A Button): Change Color\n");
-        printf("  RETURN (Start): Pause Menu Test\n\n");
     }
 
     WASM_EXPORT("update")
     void update() {
-        // 1. PULL INPUTS FROM THE HOST
+        frame_counter++;
         uint32_t pressed = get_btn_pressed();
         uint32_t just_pressed = get_btn_just_pressed();
-        uint32_t just_released = get_btn_just_released();
 
-        // 2. RECORD TRAIL
-        trail.push_back({(int)box_x, (int)box_y});
-        if (trail.size() > 40) trail.erase(trail.begin()); 
-
-        // 3. SPRINT MECHANIC (Test L Bumper)
-        if (pressed & BTN_L) {
-            speed = 8.0f; // Hold Q to sprint
-        } else {
-            speed = 4.0f;
+        // --- Resolution Testing ---
+        if (just_pressed & BTN_X) {
+            game_w = 640; game_h = 480; // High-Res
+            set_screen_res(game_w, game_h);
+        }
+        if (just_pressed & BTN_Y) {
+            game_w = 160; game_h = 90;  // Zoomed-in Chunky
+            set_screen_res(game_w, game_h);
         }
 
-        // 4. CONTINUOUS MOVEMENT
-        if (pressed & BTN_LEFT)  box_x -= speed;
-        if (pressed & BTN_RIGHT) box_x += speed;
-        if (pressed & BTN_UP)    box_y -= speed;
-        if (pressed & BTN_DOWN)  box_y += speed;
+        // --- Arcade Logic ---
+        if (state == ATTRACT_MODE) {
+            if (just_pressed & BTN_START) {
+                state = PLAYING;
+                px = game_w / 2.0f;
+                py = game_h - 30.0f;
+                b_active = false;
+            }
+        } 
+        else if (state == PLAYING) {
+            if (pressed & BTN_LEFT)  px -= SPEED;
+            if (pressed & BTN_RIGHT) px += SPEED;
+            if (pressed & BTN_UP)    py -= SPEED;
+            if (pressed & BTN_DOWN)  py += SPEED;
+            
+            // Keep on screen
+            if (px < 10) px = 10;
+            if (px > game_w - 10) px = game_w - 10;
+            if (py < 10) py = 10;
+            if (py > game_h - 10) py = game_h - 10;
 
-        // Keep box clamped to the screen boundaries
-        if (box_x < 0) box_x = 0;
-        if (box_x > WIDTH - BOX_SIZE) box_x = WIDTH - BOX_SIZE;
-        if (box_y < 0) box_y = 0;
-        if (box_y > HEIGHT - BOX_SIZE) box_y = HEIGHT - BOX_SIZE;
+            if ((just_pressed & BTN_A) && !b_active) {
+                b_active = true;
+                bx = px;
+                by = py - 10;
+                b_audio_pitch = 800.0f;
+            }
 
-        // 5. SINGLE ACTIONS (Triggered once per tap)
-        if (just_pressed & BTN_A) {
-            box_r = (box_r == 255) ? 0 : 255; // Toggle red channel
-            printf("A Button (X Key) Just Pressed!\n");
+            if (b_active) {
+                by -= 6.0f;
+                b_audio_pitch -= 40.0f;
+                if (by < 0) b_active = false;
+            }
         }
 
-        if (just_released & BTN_B) {
-            printf("B Button (Z Key) Just Released!\n");
+        for (int i = 0; i < 50; ++i) {
+            stars[i].y += stars[i].speed;
+            if (stars[i].y > game_h) {
+                stars[i].y = 0;
+                stars[i].x = (float)(rand() % game_w);
+            }
         }
 
-        if (just_pressed & BTN_START) {
-            printf("START Button (RETURN Key) Pressed! (Imagine a pause menu here)\n");
-        }
-
-        // 6. GENERATE AUDIO (Pitch linked to X position)
-        float freq = 200.0f + box_x; 
-        float phase_inc = (2.0f * 3.14159265f * freq) / SAMPLE_RATE;
-
+        // --- Audio Synthesizer ---
+        static float phase = 0.0f;
         for (int i = 0; i < AUDIO_FRAMES_PER_TICK; ++i) {
-            int16_t sample = (int16_t)(sin(audio_phase) * 4000.0f);
+            int16_t sample = 0;
+            float hum_freq = (state == PLAYING) ? 60.0f : 40.0f;
+            sample += (int16_t)(sin(phase * hum_freq) * 1000.0f);
+
+            if (b_active && b_audio_pitch > 0) {
+                sample += (sin(phase * b_audio_pitch) > 0) ? 4000 : -4000; 
+            }
+
             audio_buffer[i * 2 + 0] = sample; 
             audio_buffer[i * 2 + 1] = sample; 
-            audio_phase += phase_inc;
-            if (audio_phase > 2.0f * 3.14159265f) audio_phase -= 2.0f * 3.14159265f;
+            
+            phase += (2.0f * 3.14159f) / SAMPLE_RATE;
+            if (phase > 100.0f) phase -= 100.0f; 
         }
     }
 
     WASM_EXPORT("draw")
-	void draw() {
-		// Cast the byte array to an array of 32-bit integers
-		uint32_t* fb = (uint32_t*)framebuffer;
+    void draw() {
+        // Clear Active Screen
+        for (int i = 0; i < game_w * game_h; ++i) {
+            framebuffer[i] = C_BLACK;
+        }
 
-		// 1. Clear screen to dark purple (0xFF for 255 Alpha)
-		// 0xFF (A) | 0x28 (B) | 0x0A (G) | 0x1E (R) = 0xFF280A1E
-		uint32_t bg_color = 0xFF280A1E;
-		for (int i = 0; i < WIDTH * HEIGHT; ++i) {
-			fb[i] = bg_color;
-		}
+        // Draw Parallax Stars
+        for (int i = 0; i < 50; ++i) {
+            uint32_t star_color = (stars[i].speed > 0.8f) ? C_WHITE : C_GRAY;
+            draw_rect(stars[i].x, stars[i].y, 1, 1, star_color);
+        }
 
-		// 2. Draw the fading trail
-		for (size_t i = 0; i < trail.size(); ++i) {
-			int tx = trail[i].x;
-			int ty = trail[i].y;
-			uint8_t alpha = (uint8_t)((float)i / trail.size() * 255.0f);
-			
-			// Build the 32-bit color: Alpha | Blue(100) | Green(0) | Red(box_r)
-			uint32_t trail_color = (alpha << 24) | (100 << 16) | (0 << 8) | box_r;
+        // Draw Game
+        if (state == PLAYING) {
+            if (b_active) draw_rect(bx - 1, by, 2, 8, C_YELLOW);
 
-			for (int y = 10; y < BOX_SIZE - 10; ++y) {
-				for (int x = 10; x < BOX_SIZE - 10; ++x) {
-					fb[(ty + y) * WIDTH + (tx + x)] = trail_color;
-				}
-			}
-		}
-
-		// 3. Draw the main interactive box
-		int bx = (int)box_x;
-		int by = (int)box_y;
-		uint32_t box_color = (255 << 24) | (0 << 16) | (128 << 8) | box_r;
-
-		for (int y = 0; y < BOX_SIZE; ++y) {
-			for (int x = 0; x < BOX_SIZE; ++x) {
-				fb[(by + y) * WIDTH + (bx + x)] = box_color;
-			}
-		}
-	}
+            draw_rect(px - 6, py + 4, 12, 4, C_GRAY);   
+            draw_rect(px - 2, py - 4, 4,  12, C_GREEN); 
+            draw_rect(px - 1, py - 6, 2,  2,  C_RED);   
+        } 
+        else if (state == ATTRACT_MODE) {
+            if ((frame_counter / 30) % 2 == 0) {
+                draw_rect((game_w/2.0f) - 40, (game_h/2.0f) - 10, 80, 20, C_RED);
+                draw_rect((game_w/2.0f) - 38, (game_h/2.0f) - 8,  76, 16, C_YELLOW);
+                draw_rect((game_w/2.0f) - 36, (game_h/2.0f) - 6,  72, 12, C_BLACK);
+            }
+        }
+    }
 }

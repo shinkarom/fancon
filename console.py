@@ -11,32 +11,21 @@ import skia
 # ==========================================
 # CONSOLE HARDWARE SPECIFICATIONS
 # ==========================================
-RES_W = 480
-RES_H = 270
-VRAM_SIZE = RES_W * RES_H * 4  # 4 bytes per pixel (RGBA)
-
-FPS = 60
-
+MAX_RES = 640
 SAMPLE_RATE = 44100
 CHANNELS = 2
-AUDIO_BYTES_PER_TICK = int((SAMPLE_RATE / FPS) * CHANNELS * 2) 
+FPS = 60
+
+# 44100 / 60 = 735 samples * 2 channels * 2 bytes = 2940 bytes per tick
+AUDIO_BYTES_PER_TICK = int((SAMPLE_RATE / FPS) * CHANNELS * 2)
 
 # ==========================================
 # INPUT SUBSYSTEM (GLFW Key Mappings)
 # ==========================================
 KEY_MAP = {
-    glfw.KEY_UP: 1,
-    glfw.KEY_DOWN: 2,
-    glfw.KEY_LEFT: 4,
-    glfw.KEY_RIGHT: 8,
-    glfw.KEY_X: 16,            # A button
-    glfw.KEY_Z: 32,            # B button
-    glfw.KEY_S: 64,            # X button
-    glfw.KEY_A: 128,           # Y button
-    glfw.KEY_ENTER: 256,       # Start
-    glfw.KEY_RIGHT_SHIFT: 512, # Select
-    glfw.KEY_Q: 1024,          # L Bumper
-    glfw.KEY_W: 2048           # R Bumper
+    glfw.KEY_UP: 1, glfw.KEY_DOWN: 2, glfw.KEY_LEFT: 4, glfw.KEY_RIGHT: 8,
+    glfw.KEY_X: 16, glfw.KEY_Z: 32, glfw.KEY_S: 64, glfw.KEY_A: 128,
+    glfw.KEY_ENTER: 256, glfw.KEY_RIGHT_SHIFT: 512, glfw.KEY_Q: 1024, glfw.KEY_W: 2048
 }
 
 class AudioRingBuffer:
@@ -63,10 +52,10 @@ class AudioRingBuffer:
                     self.buffer.clear()
             frames_requested = yield chunk
 
-def calculate_letterbox(win_w, win_h):
-    scale = min(win_w / RES_W, win_h / RES_H)
-    new_w = RES_W * scale
-    new_h = RES_H * scale
+def calculate_letterbox(win_w, win_h, res_w, res_h):
+    scale = min(win_w / res_w, win_h / res_h)
+    new_w = res_w * scale
+    new_h = res_h * scale
     offset_x = (win_w - new_w) / 2
     offset_y = (win_h - new_h) / 2
     return skia.Rect.MakeXYWH(offset_x, offset_y, new_w, new_h)
@@ -94,16 +83,29 @@ def main():
     store = wasmtime.Store(engine)
     store.set_wasi(wasi_config)
     
+    # ------------------------------------------
+    # HOST API FUNCTIONS
+    # ------------------------------------------
     input_state = {"pressed": 0, "just_pressed": 0, "just_released": 0}
+    console_state = {"res_w": 320, "res_h": 180}
 
     def host_get_btn_pressed(): return input_state["pressed"]
     def host_get_btn_just_pressed(): return input_state["just_pressed"]
     def host_get_btn_just_released(): return input_state["just_released"]
 
+    def host_set_screen_res(w, h):
+        console_state["res_w"] = max(1, min(MAX_RES, w))
+        console_state["res_h"] = max(1, min(MAX_RES, h))
+
+    # Bind Inputs
     sig_i32 = wasmtime.FuncType([], [wasmtime.ValType.i32()])
     linker.define_func("env", "get_btn_pressed", sig_i32, host_get_btn_pressed)
     linker.define_func("env", "get_btn_just_pressed", sig_i32, host_get_btn_just_pressed)
     linker.define_func("env", "get_btn_just_released", sig_i32, host_get_btn_just_released)
+
+    # Bind Resolution Controller
+    sig_set_res = wasmtime.FuncType([wasmtime.ValType.i32(), wasmtime.ValType.i32()], [])
+    linker.define_func("env", "set_screen_res", sig_set_res, host_set_screen_res)
 
     module = wasmtime.Module.from_file(engine, cart_path)
     instance = linker.instantiate(store, module)
@@ -131,12 +133,11 @@ def main():
     audio_device.start(audio_gen)
 
     # ==========================================
-    # GLFW & SKIA (GPU BACKEND) SETUP
+    # GLFW & SKIA SETUP
     # ==========================================
     if not glfw.init():
         sys.exit(1)
 
-    # Request an OpenGL Core profile window
     glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
     glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
     glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
@@ -145,23 +146,11 @@ def main():
     monitor = glfw.get_primary_monitor()
     mode = glfw.get_video_mode(monitor)
     window = glfw.create_window(mode.size.width, mode.size.height, "Skia Fantasy Console", monitor, None)
-    
     glfw.make_context_current(window)
-    glfw.swap_interval(1) # VSYNC ON (Locks to 60 FPS automatically)
+    glfw.swap_interval(1) # VSYNC ON
 
-    # Bind Skia directly to the OpenGL context
     context = skia.GrDirectContext.MakeGL()
 
-    # Pre-allocate Skia info for the 480x270 WASM buffer
-    vram_info = skia.ImageInfo.Make(
-        RES_W, RES_H, 
-        skia.ColorType.kRGBA_8888_ColorType, 
-        skia.AlphaType.kUnpremul_AlphaType
-    )
-    
-    vram_rect = skia.Rect.MakeWH(RES_W, RES_H)
-
-    # FPS Font (Skia native font rendering!)
     font = skia.Font(skia.Typeface.MakeFromName("Consolas", skia.FontStyle.Bold()), 24)
     paint_fps = skia.Paint(Color=skia.ColorYELLOW, AntiAlias=True)
 
@@ -169,7 +158,6 @@ def main():
     current_btn_mask = 0
     prev_btn_mask = 0
 
-    # GLFW Key Callback
     def key_callback(win, key, scancode, action, mods):
         nonlocal current_btn_mask, show_fps
         if key == glfw.KEY_ESCAPE and action == glfw.PRESS:
@@ -178,10 +166,8 @@ def main():
             show_fps = not show_fps
             
         if key in KEY_MAP:
-            if action == glfw.PRESS:
-                current_btn_mask |= KEY_MAP[key]
-            elif action == glfw.RELEASE:
-                current_btn_mask &= ~KEY_MAP[key]
+            if action == glfw.PRESS: current_btn_mask |= KEY_MAP[key]
+            elif action == glfw.RELEASE: current_btn_mask &= ~KEY_MAP[key]
 
     glfw.set_key_callback(window, key_callback)
 
@@ -195,7 +181,6 @@ def main():
     while not glfw.window_should_close(window):
         glfw.poll_events()
 
-        # Input tracking
         input_state["just_pressed"] = current_btn_mask & ~prev_btn_mask
         input_state["just_released"] = ~current_btn_mask & prev_btn_mask
         input_state["pressed"] = current_btn_mask
@@ -212,34 +197,35 @@ def main():
             ring_buffer.write(raw_audio)
 
         # Video Extract
+        res_w = console_state["res_w"]
+        res_h = console_state["res_h"]
         fb_ptr = get_framebuffer_ptr(store)
-        raw_vram = wasm_memory.read(store, fb_ptr, fb_ptr + VRAM_SIZE)
         
-        # 1. Map WASM memory directly to Skia (Zero-copy GPU upload)
-        skia_image = skia.Image.MakeRasterData(vram_info, skia.Data.MakeWithoutCopy(raw_vram), RES_W * 4)
+        # Pull only the exact amount of VRAM needed for the active resolution
+        active_vram_bytes = res_w * res_h * 4
+        raw_vram = wasm_memory.read(store, fb_ptr, fb_ptr + active_vram_bytes)
+        
+        vram_info = skia.ImageInfo.Make(res_w, res_h, skia.ColorType.kRGBA_8888_ColorType, skia.AlphaType.kUnpremul_AlphaType)
+        skia_image = skia.Image.MakeRasterData(vram_info, skia.Data.MakeWithoutCopy(raw_vram), res_w * 4)
 
-        # 2. Get the current window size and create a GPU Render Target
+        # Skia GPU Drawing
         win_w, win_h = glfw.get_framebuffer_size(window)
         backend_render_target = skia.GrBackendRenderTarget(
-            win_w, win_h, 0, 0, skia.GrGLFramebufferInfo(0, 0x8058) # 0x8058 = GL_RGBA8
+            win_w, win_h, 0, 0, skia.GrGLFramebufferInfo(0, 0x8058)
         )
         surface = skia.Surface.MakeFromBackendRenderTarget(
-            context, backend_render_target, skia.kBottomLeft_GrSurfaceOrigin,
-            skia.kRGBA_8888_ColorType, None
+            context, backend_render_target, skia.kBottomLeft_GrSurfaceOrigin, skia.kRGBA_8888_ColorType, None
         )
+        
         canvas = surface.getCanvas()
-
-        # 3. GPU Rendering
         canvas.clear(skia.ColorBLACK)
         
-        # Draw the WASM buffer scaled to letterbox, using Pixel-Art Nearest Neighbor filtering!
-        dest_rect = calculate_letterbox(win_w, win_h)
-        canvas.drawImageRect(
-            skia_image, vram_rect, dest_rect, 
-            skia.SamplingOptions(skia.FilterMode.kNearest)
-        )
+        dest_rect = calculate_letterbox(win_w, win_h, res_w, res_h)
+        source_rect = skia.Rect.MakeWH(res_w, res_h)
+        
+        canvas.drawImageRect(skia_image, source_rect, dest_rect, skia.SamplingOptions(skia.FilterMode.kNearest))
 
-        # 4. FPS Calculation
+        # FPS calculation
         frames += 1
         current_time = time.time()
         if current_time - last_time >= 1.0:
@@ -250,26 +236,16 @@ def main():
         if show_fps:
             canvas.drawString(fps_display, dest_rect.right() - 100, dest_rect.top() + 30, font, paint_fps)
 
-        # 5. Flush Skia commands to the GPU and swap the screen buffer
         context.flush()
         glfw.swap_buffers(window)
 
-    # ==========================================
-    # SHUTDOWN & CLEANUP
-    # ==========================================
     print("Shutting down Console...")
-    
-    # 1. Stop the audio hardware thread first
     try:
         audio_device.stop()
         audio_device.close()
-    except:
-        pass
+    except: pass
 
-    # 2. Destroy the window context
     glfw.terminate()
-    
-    # 3. Force the OS to instantly kill the Python process and any stray background threads
     os._exit(0)
 
 if __name__ == "__main__":
