@@ -1,23 +1,11 @@
-#include <cstdint>
+#include "console.h"
+
 #include <cstdio>
 #include <cmath>
 #include <vector>
 #include <string>
 #include <fstream>
 #include <iostream>
-
-#define WIDTH 480
-#define HEIGHT 270
-
-// ==========================================
-// AUDIO & VIDEO BUFFERS
-// ==========================================
-uint8_t framebuffer[WIDTH * HEIGHT * 4];
-
-const int SAMPLE_RATE = 44100;
-const int AUDIO_FRAMES_PER_TICK = 735; 
-int16_t audio_buffer[AUDIO_FRAMES_PER_TICK * 2];
-float audio_phase = 0.0f;
 
 // ==========================================
 // GAME STATE
@@ -31,44 +19,14 @@ uint8_t box_r = 255; // Red color channel (toggled by 'A' button)
 struct Point { int x, y; };
 std::vector<Point> trail;
 
-// BUTTON MASKS (Must match Python Host)
-const uint32_t BTN_UP    = 1;
-const uint32_t BTN_DOWN  = 2;
-const uint32_t BTN_LEFT  = 4;
-const uint32_t BTN_RIGHT = 8;
-const uint32_t BTN_A     = 16;
-const uint32_t BTN_B     = 32;
+float audio_phase = 0.0f;
 
 // ==========================================
-// HOST API IMPORTS (The "Pull" Model)
-// ==========================================
-extern "C" {
-    // These tell the compiler: Python will provide these functions at runtime!
-    __attribute__((import_module("env"), import_name("get_btn_pressed")))
-    uint32_t get_btn_pressed();
-
-    __attribute__((import_module("env"), import_name("get_btn_just_pressed")))
-    uint32_t get_btn_just_pressed();
-
-    __attribute__((import_module("env"), import_name("get_btn_just_released")))
-    uint32_t get_btn_just_released();
-}
-
-// ==========================================
-// CARTRIDGE EXPORTS (Called by Host)
+// GAME LIFECYCLE EXPORTS
 // ==========================================
 extern "C" {
 
-    __attribute__((export_name("get_framebuffer_ptr")))
-    uint8_t* get_framebuffer_ptr() { return framebuffer; }
-
-    __attribute__((export_name("get_audio_ptr")))
-    int16_t* get_audio_ptr() { return audio_buffer; }
-
-    __attribute__((export_name("get_audio_size")))
-    int get_audio_size() { return AUDIO_FRAMES_PER_TICK * 2 * sizeof(int16_t); }
-
-    __attribute__((export_name("init")))
+    WASM_EXPORT("init")
     void init() {
         printf("\n--- WASM C++ INITIALIZATION ---\n");
 
@@ -76,7 +34,7 @@ extern "C" {
         trail.reserve(50);
         printf("[OK] std::vector heap allocation successful.\n");
 
-        // 2. PROVE FILESYSTEM WORKS (Read-Only)
+        // 2. PROVE FILESYSTEM WORKS (Read-Only via WASI)
         std::ifstream file("/hello.txt");
         std::string file_message = "";
         
@@ -90,10 +48,14 @@ extern "C" {
         }
         
         printf("-------------------------------\n");
-        printf("Controls: Arrow Keys to move, 'X' key (A Button) to change color.\n\n");
+        printf("Controls:\n");
+        printf("  Arrow Keys : Move\n");
+        printf("  Q (L Bumper): Hold to Sprint\n");
+        printf("  X (A Button): Change Color\n");
+        printf("  RETURN (Start): Pause Menu Test\n\n");
     }
 
-    __attribute__((export_name("update")))
+    WASM_EXPORT("update")
     void update() {
         // 1. PULL INPUTS FROM THE HOST
         uint32_t pressed = get_btn_pressed();
@@ -104,29 +66,40 @@ extern "C" {
         trail.push_back({(int)box_x, (int)box_y});
         if (trail.size() > 40) trail.erase(trail.begin()); 
 
-        // 3. CONTINUOUS MOVEMENT
+        // 3. SPRINT MECHANIC (Test L Bumper)
+        if (pressed & BTN_L) {
+            speed = 8.0f; // Hold Q to sprint
+        } else {
+            speed = 4.0f;
+        }
+
+        // 4. CONTINUOUS MOVEMENT
         if (pressed & BTN_LEFT)  box_x -= speed;
         if (pressed & BTN_RIGHT) box_x += speed;
         if (pressed & BTN_UP)    box_y -= speed;
         if (pressed & BTN_DOWN)  box_y += speed;
 
-        // Keep box clamped to the screen
+        // Keep box clamped to the screen boundaries
         if (box_x < 0) box_x = 0;
         if (box_x > WIDTH - BOX_SIZE) box_x = WIDTH - BOX_SIZE;
         if (box_y < 0) box_y = 0;
         if (box_y > HEIGHT - BOX_SIZE) box_y = HEIGHT - BOX_SIZE;
 
-        // 4. SINGLE ACTIONS (Triggered once per tap)
+        // 5. SINGLE ACTIONS (Triggered once per tap)
         if (just_pressed & BTN_A) {
             box_r = (box_r == 255) ? 0 : 255; // Toggle red channel
-            printf("A Button Just Pressed!\n");
+            printf("A Button (X Key) Just Pressed!\n");
         }
 
         if (just_released & BTN_B) {
-            printf("B Button Just Released!\n");
+            printf("B Button (Z Key) Just Released!\n");
         }
 
-        // 5. GENERATE AUDIO (Pitch linked to X position)
+        if (just_pressed & BTN_START) {
+            printf("START Button (RETURN Key) Pressed! (Imagine a pause menu here)\n");
+        }
+
+        // 6. GENERATE AUDIO (Pitch linked to X position)
         float freq = 200.0f + box_x; 
         float phase_inc = (2.0f * 3.14159265f * freq) / SAMPLE_RATE;
 
@@ -139,9 +112,9 @@ extern "C" {
         }
     }
 
-    __attribute__((export_name("draw")))
+    WASM_EXPORT("draw")
     void draw() {
-        // Clear screen to dark purple
+        // 1. Clear screen to dark purple
         for (int i = 0; i < WIDTH * HEIGHT * 4; i += 4) {
             framebuffer[i + 0] = 30;  // R
             framebuffer[i + 1] = 10;  // G
@@ -149,7 +122,7 @@ extern "C" {
             framebuffer[i + 3] = 255; // A
         }
 
-        // Draw the fading trail
+        // 2. Draw the fading trail
         for (size_t i = 0; i < trail.size(); ++i) {
             int tx = trail[i].x;
             int ty = trail[i].y;
@@ -166,7 +139,7 @@ extern "C" {
             }
         }
 
-        // Draw the main interactive box
+        // 3. Draw the main interactive box
         int bx = (int)box_x;
         int by = (int)box_y;
 
