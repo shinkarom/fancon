@@ -5,7 +5,7 @@
 // ==========================================
 // COLOR PALETTE (0xAABBGGRR)
 // ==========================================
-constexpr uint32_t C_BLACK  = 0xFF000000;
+constexpr uint32_t C_BLACK   = 0xFF000000;
 constexpr uint32_t C_WHITE  = 0xFFFFFFFF;
 constexpr uint32_t C_RED    = 0xFF0000FF;
 constexpr uint32_t C_GREEN  = 0xFF00FF00;
