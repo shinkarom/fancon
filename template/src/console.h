@@ -23,6 +23,9 @@ constexpr uint32_t BTN_B      = 32;
 constexpr uint32_t BTN_X      = 64;
 constexpr uint32_t BTN_Y      = 128;
 constexpr uint32_t BTN_START  = 256;
+constexpr uint32_t BTN_SELECT = 512;
+constexpr uint32_t BTN_L      = 1024;
+constexpr uint32_t BTN_R      = 2048;
 
 // ==========================================
 // SYSTEM BUFFERS
