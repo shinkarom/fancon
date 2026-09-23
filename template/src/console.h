@@ -5,9 +5,10 @@
 #define WASM_EXPORT(name) __attribute__((export_name(name)))
 
 // ==========================================
-// CONSOLE SPECS
+// CONSOLE SPECS (1080p High-Def Ready)
 // ==========================================
-constexpr int MAX_RES = 640;
+constexpr int MAX_RES_W = 1920;
+constexpr int MAX_RES_H = 1080;
 constexpr int SAMPLE_RATE = 44100;
 constexpr int AUDIO_FRAMES_PER_TICK = 735; 
 
@@ -30,7 +31,8 @@ constexpr uint32_t BTN_R      = 2048;
 // ==========================================
 // SYSTEM BUFFERS
 // ==========================================
-inline uint32_t framebuffer[MAX_RES * MAX_RES];
+// Sized for 1080p (1920 * 1080 = 2,073,600 uint32s = ~8.3 MB)
+inline uint32_t framebuffer[MAX_RES_W * MAX_RES_H];
 inline int16_t audio_buffer[AUDIO_FRAMES_PER_TICK * 2];
 
 extern "C" {

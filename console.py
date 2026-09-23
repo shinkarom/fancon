@@ -1,8 +1,14 @@
+#!/usr/bin/env python3
+"""
+High-Definition Skia + WASM Fantasy Console (Zero-Copy Architecture)
+"""
+
 import argparse
 import sys
 import threading
 import os
 import time
+import ctypes
 import wasmtime
 import miniaudio
 import glfw
@@ -11,7 +17,11 @@ import skia
 # ==========================================
 # CONSOLE HARDWARE SPECIFICATIONS
 # ==========================================
-MAX_RES = 640
+MAX_RES_W = 1920
+MAX_RES_H = 1080
+DEFAULT_RES_W = 320
+DEFAULT_RES_H = 180
+
 SAMPLE_RATE = 44100
 CHANNELS = 2
 FPS = 60
@@ -38,29 +48,58 @@ GAMEPAD_MAP = {
     glfw.GAMEPAD_BUTTON_LEFT_BUMPER: 1024, glfw.GAMEPAD_BUTTON_RIGHT_BUMPER: 2048
 }
 
-class AudioRingBuffer:
-    def __init__(self, max_bytes=44100 * 4): 
+# ==========================================
+# O(1) CIRCULAR AUDIO RING BUFFER
+# ==========================================
+class FastAudioRingBuffer:
+    """Pre-allocated circular buffer. Zero memory allocations during playback."""
+    def __init__(self, capacity=SAMPLE_RATE * CHANNELS * 2):  # ~1 second capacity
         self.lock = threading.Lock()
-        self.buffer = bytearray()
-        self.max_bytes = max_bytes
+        self.buffer = bytearray(capacity)
+        self.capacity = capacity
+        self.read_pos = 0
+        self.write_pos = 0
+        self.size = 0
 
-    def write(self, pcm_bytes):
+    def write(self, data):
+        data_len = len(data)
         with self.lock:
-            if len(self.buffer) < self.max_bytes:
-                self.buffer.extend(pcm_bytes)
+            # Overrun protection: if buffer overflows, advance read head (drop oldest)
+            if self.size + data_len > self.capacity:
+                overflow = (self.size + data_len) - self.capacity
+                self.read_pos = (self.read_pos + overflow) % self.capacity
+                self.size -= overflow
+
+            # Copy data in 1 or 2 chunks
+            first_part = min(data_len, self.capacity - self.write_pos)
+            self.buffer[self.write_pos : self.write_pos + first_part] = data[:first_part]
+            second_part = data_len - first_part
+            if second_part > 0:
+                self.buffer[0 : second_part] = data[first_part:]
+
+            self.write_pos = (self.write_pos + data_len) % self.capacity
+            self.size += data_len
 
     def read_generator(self):
-        frames_requested = yield b"" 
+        frames_requested = yield b""
         while True:
-            bytes_needed = frames_requested * 4 
+            bytes_needed = frames_requested * (CHANNELS * 2)
+            out = bytearray(bytes_needed)
             with self.lock:
-                if len(self.buffer) >= bytes_needed:
-                    chunk = bytes(self.buffer[:bytes_needed])
-                    del self.buffer[:bytes_needed]
-                else:
-                    chunk = bytes(self.buffer) + b'\x00' * (bytes_needed - len(self.buffer))
-                    self.buffer.clear()
-            frames_requested = yield chunk
+                available = min(bytes_needed, self.size)
+                if available > 0:
+                    first_part = min(available, self.capacity - self.read_pos)
+                    out[:first_part] = self.buffer[self.read_pos : self.read_pos + first_part]
+                    second_part = available - first_part
+                    if second_part > 0:
+                        out[first_part : first_part + second_part] = self.buffer[:second_part]
+
+                    self.read_pos = (self.read_pos + available) % self.capacity
+                    self.size -= available
+                # Any remaining unfilled bytes in 'out' are 0x00 (silence)
+
+            frames_requested = yield bytes(out)
+
 
 def calculate_letterbox(win_w, win_h, res_w, res_h):
     scale = min(win_w / res_w, win_h / res_h)
@@ -69,6 +108,7 @@ def calculate_letterbox(win_w, win_h, res_w, res_h):
     offset_x = (win_w - new_w) / 2
     offset_y = (win_h - new_h) / 2
     return skia.Rect.MakeXYWH(offset_x, offset_y, new_w, new_h)
+
 
 def poll_gamepad():
     gamepad_mask = 0
@@ -87,8 +127,20 @@ def poll_gamepad():
 
     return gamepad_mask
 
+
+def get_wasm_memory_address(wasm_memory, store) -> int:
+    """Extracts raw host virtual memory address of WASM linear memory."""
+    raw_ptr = wasm_memory.data_ptr(store)
+    if hasattr(raw_ptr, "value") and raw_ptr.value is not None:
+        return raw_ptr.value
+    elif isinstance(raw_ptr, int):
+        return raw_ptr
+    else:
+        return ctypes.cast(raw_ptr, ctypes.c_void_p).value or 0
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Skia + WASM Fantasy Console")
+    parser = argparse.ArgumentParser(description="High-Def Skia + WASM Fantasy Console")
     parser.add_argument("cart", help="Path to the .wasm cartridge to run")
     args = parser.parse_args()
 
@@ -110,7 +162,7 @@ def main():
     
     # Host State
     input_state = {"pressed": 0, "just_pressed": 0, "just_released": 0}
-    console_state = {"res_w": 320, "res_h": 180}
+    console_state = {"res_w": DEFAULT_RES_W, "res_h": DEFAULT_RES_H}
 
     # Bind Inputs & State to WASM
     sig_i32 = wasmtime.FuncType([], [wasmtime.ValType.i32()])
@@ -120,8 +172,8 @@ def main():
 
     sig_set_res = wasmtime.FuncType([wasmtime.ValType.i32(), wasmtime.ValType.i32()], [])
     def host_set_screen_res(w, h):
-        console_state["res_w"] = max(1, min(MAX_RES, w))
-        console_state["res_h"] = max(1, min(MAX_RES, h))
+        console_state["res_w"] = max(1, min(MAX_RES_W, w))
+        console_state["res_h"] = max(1, min(MAX_RES_H, h))
     linker.define_func("env", "set_screen_res", sig_set_res, host_set_screen_res)
 
     module = wasmtime.Module.from_file(engine, cart_path)
@@ -132,6 +184,7 @@ def main():
     wasm_update = exports["update"]
     wasm_draw = exports["draw"]
     get_framebuffer_ptr = exports["get_framebuffer_ptr"]
+    has_audio = "get_audio_ptr" in exports
     
     if "_initialize" in exports: exports["_initialize"](store)
     if "init" in exports: exports["init"](store)
@@ -139,7 +192,7 @@ def main():
     # ==========================================
     # AUDIO SETUP
     # ==========================================
-    ring_buffer = AudioRingBuffer()
+    ring_buffer = FastAudioRingBuffer()
     audio_device = miniaudio.PlaybackDevice(
         output_format=miniaudio.SampleFormat.SIGNED16,
         nchannels=CHANNELS,
@@ -187,11 +240,9 @@ def main():
 
     glfw.set_key_callback(window, key_callback)
 
-    # Cached Skia Render Target State
     curr_win_w, curr_win_h = 0, 0
     surface = None
 
-    # Timing variables for locked 60Hz logic
     time_prev = time.perf_counter()
     time_accumulator = 0.0
 
@@ -210,9 +261,9 @@ def main():
         time_prev = time_now
         time_accumulator += delta
 
-        # Fixed 60Hz tick loop (runs correctly on 60, 120, 144, 240Hz monitors)
+        # Fixed 60Hz tick loop
         while time_accumulator >= FRAME_TIME:
-            # Update inputs
+            # 1. Update Inputs
             gamepad_btn_mask = poll_gamepad()
             current_btn_mask = keyboard_btn_mask | gamepad_btn_mask
 
@@ -221,31 +272,44 @@ def main():
             input_state["pressed"] = current_btn_mask
             prev_btn_mask = current_btn_mask
 
-            # Step WASM cartridge simulation
+            # 2. Step WASM simulation
             wasm_update(store)
 
-            # Audio Extract
-            if "get_audio_ptr" in exports:
+            # 3. Audio Extraction (Zero-Copy directly from WASM memory)
+            if has_audio:
+                base_addr = get_wasm_memory_address(wasm_memory, store)
                 audio_ptr = exports["get_audio_ptr"](store)
-                raw_audio = wasm_memory.read(store, audio_ptr, audio_ptr + AUDIO_BYTES_PER_TICK)
-                ring_buffer.write(raw_audio)
+                audio_addr = base_addr + audio_ptr
+                audio_view = (ctypes.c_uint8 * AUDIO_BYTES_PER_TICK).from_address(audio_addr)
+                ring_buffer.write(audio_view)
 
             time_accumulator -= FRAME_TIME
 
-        # Draw frame
+        # 4. Draw frame inside guest
         wasm_draw(store)
 
-        # Video Framebuffer Extraction
+        # 5. ZERO-COPY Video Framebuffer Extraction
         res_w = console_state["res_w"]
         res_h = console_state["res_h"]
         fb_ptr = get_framebuffer_ptr(store)
         active_vram_bytes = res_w * res_h * 4
-        raw_vram = wasm_memory.read(store, fb_ptr, fb_ptr + active_vram_bytes)
-        
-        vram_info = skia.ImageInfo.Make(res_w, res_h, skia.ColorType.kRGBA_8888_ColorType, skia.AlphaType.kUnpremul_AlphaType)
-        skia_image = skia.Image.MakeRasterData(vram_info, skia.Data.MakeWithoutCopy(raw_vram), res_w * 4)
 
-        # Cache/Recreate Skia Surface only on Window Resize
+        # Grab raw host pointer to WASM linear memory
+        base_addr = get_wasm_memory_address(wasm_memory, store)
+        vram_addr = base_addr + fb_ptr
+
+        # Construct Skia Data directly pointing to WASM memory without copying!
+        vram_raw_buffer = (ctypes.c_uint8 * active_vram_bytes).from_address(vram_addr)
+        skia_data = skia.Data.MakeWithoutCopy(vram_raw_buffer)
+
+        vram_info = skia.ImageInfo.Make(
+            res_w, res_h, 
+            skia.ColorType.kRGBA_8888_ColorType, 
+            skia.AlphaType.kUnpremul_AlphaType
+        )
+        skia_image = skia.Image.MakeRasterData(vram_info, skia_data, res_w * 4)
+
+        # 6. Render Target & Viewport
         win_w, win_h = glfw.get_framebuffer_size(window)
         if win_w != curr_win_w or win_h != curr_win_h or surface is None:
             curr_win_w, curr_win_h = win_w, win_h
@@ -262,9 +326,10 @@ def main():
         dest_rect = calculate_letterbox(win_w, win_h, res_w, res_h)
         source_rect = skia.Rect.MakeWH(res_w, res_h)
         
+        # kNearest preserves crisp retro pixel art, or use kLinear for smooth HD scaling
         canvas.drawImageRect(skia_image, source_rect, dest_rect, skia.SamplingOptions(skia.FilterMode.kNearest))
 
-        # FPS Calculation
+        # 7. FPS Counter Overlay
         frames += 1
         current_time = time.time()
         if current_time - last_fps_time >= 1.0:
@@ -282,10 +347,12 @@ def main():
     try:
         audio_device.stop()
         audio_device.close()
-    except: pass
+    except Exception:
+        pass
 
     glfw.terminate()
     os._exit(0)
+
 
 if __name__ == "__main__":
     main()
