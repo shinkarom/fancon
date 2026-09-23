@@ -2,140 +2,191 @@
 #include <cmath>
 #include <cstdlib>
 #include <algorithm>
+#include <vector>
+#include <cstdio>
+#include <chrono>
 
 // ==========================================
-// PALETTE & COLOR UTILS (0xAABBGGRR)
+// MATHEMATICS & 3D PRIMITIVES
 // ==========================================
-constexpr uint32_t C_BLACK   = 0xFF000000;
-constexpr uint32_t C_WHITE   = 0xFFFFFFFF;
-constexpr uint32_t C_RED     = 0xFF3333FF;
-constexpr uint32_t C_GREEN   = 0xFF33FF33;
-constexpr uint32_t C_BLUE    = 0xFFFF5533;
-constexpr uint32_t C_CYAN    = 0xFFFFFF33;
-constexpr uint32_t C_YELLOW  = 0xFF33FFFF;
-constexpr uint32_t C_MAGENTA = 0xFFFF33FF;
-constexpr uint32_t C_DARK    = 0xFF181010;
+constexpr float PI = 3.14159265358979323846f;
 
-// Additive Blend: dst + src (clamped to 255 per channel)
-inline uint32_t blend_add(uint32_t dst, uint32_t src) {
-    uint32_t r = (dst & 0xFF) + (src & 0xFF);
-    uint32_t g = ((dst >> 8) & 0xFF) + ((src >> 8) & 0xFF);
-    uint32_t b = ((dst >> 16) & 0xFF) + ((src >> 16) & 0xFF);
-    return 0xFF000000 | 
-           (std::min(b, 255u) << 16) | 
-           (std::min(g, 255u) << 8) | 
-           std::min(r, 255u);
+struct Vec3 {
+    float x, y, z;
+    constexpr Vec3() : x(0), y(0), z(0) {}
+    constexpr Vec3(float x, float y, float z) : x(x), y(y), z(z) {}
+
+    Vec3 operator+(const Vec3& o) const { return {x + o.x, y + o.y, z + o.z}; }
+    Vec3 operator-(const Vec3& o) const { return {x - o.x, y - o.y, z - o.z}; }
+    Vec3 operator*(float s) const { return {x * s, y * s, z * s}; }
+
+    float dot(const Vec3& o) const { return x * o.x + y * o.y + z * o.z; }
+    Vec3 cross(const Vec3& o) const {
+        return { y * o.z - z * o.y, z * o.x - x * o.z, x * o.y - y * o.x };
+    }
+    Vec3 normalize() const {
+        float l = std::sqrt(x * x + y * y + z * z);
+        return l > 0.00001f ? Vec3{x / l, y / l, z / l} : Vec3{0, 0, 0};
+    }
+};
+
+struct Vertex {
+    Vec3 pos;       // Model space
+    Vec3 normal;    // Normal
+    Vec3 view_pos;  // Camera view space
+    float sx, sy;   // Screen coords
+    float inv_z;    // 1 / Z for depth interpolation
+    float light;    // Calculated vertex lighting intensity
+};
+
+struct Triangle {
+    int v0, v1, v2;
+    Vec3 face_normal;
+};
+
+// ==========================================
+// COLOR SYSTEM
+// ==========================================
+inline uint32_t rgb(uint8_t r, uint8_t g, uint8_t b) {
+    return 0xFF000000 | (b << 16) | (g << 8) | r;
+}
+
+inline uint32_t shade_color(uint32_t base, float intensity) {
+    intensity = std::max(0.0f, std::min(1.5f, intensity));
+    uint8_t r = std::min(255u, (uint32_t)((base & 0xFF) * intensity));
+    uint8_t g = std::min(255u, (uint32_t)(((base >> 8) & 0xFF) * intensity));
+    uint8_t b = std::min(255u, (uint32_t)(((base >> 16) & 0xFF) * intensity));
+    return 0xFF000000 | (b << 16) | (g << 8) | r;
 }
 
 // ==========================================
-// RESOLUTION PRESETS
+// ENGINE BUFFERS & RESOLUTIONS
 // ==========================================
-struct ResPreset {
-    int w, h;
-};
+alignas(16) static float z_buffer[MAX_RES_W * MAX_RES_H];
 
+struct ResPreset { int w, h; const char* name; };
 const ResPreset RESOLUTIONS[] = {
-    {160, 90},    // 0: Ultra Low
-    {320, 180},   // 1: Retro 16:9
-    {480, 270},   // 2: Portable
-    {640, 360},   // 3: SD Widescreen
-    {640, 480},   // 4: Classic VGA 4:3
-    {960, 540},   // 5: qHD
-    {1280, 720},  // 6: 720p HD
-    {1920, 1080}  // 7: 1080p Full HD
+    {160, 90,   "160x90   (Ultra-Retro)"},
+    {320, 180,  "320x180  (Retro 16:9)"},
+    {480, 270,  "480x270  (Portable)"},
+    {640, 360,  "640x360  (SD Widescreen)"},
+    {640, 480,  "640x480  (Classic VGA)"},
+    {960, 540,  "960x540  (qHD)"},
+    {1280, 720, "1280x720 (720p HD)"},
+    {1920, 1080,"1920x1080(1080p Full HD)"}
 };
 constexpr int NUM_RESOLUTIONS = sizeof(RESOLUTIONS) / sizeof(RESOLUTIONS[0]);
-int current_res_idx = 1; // Default: 320x180
-int game_w = 320;
-int game_h = 180;
+int current_res_idx = 3; // Default: 640x360
+int game_w = 640;
+int game_h = 360;
 
-// ==========================================
-// GAME STATE & STRESS BENCHMARK
-// ==========================================
-enum GameState { ATTRACT_MODE, PLAYING };
-GameState state = ATTRACT_MODE;
+// Shading Modes
+enum ShadingMode { GOURAUD = 0, FLAT, NORMALS, WIREFRAME, MODE_COUNT };
+ShadingMode current_mode = GOURAUD;
+
+// Geometry Mesh Data
+std::vector<Vertex> mesh_vertices;
+std::vector<Triangle> mesh_triangles;
+int mesh_segments_u = 48;
+int mesh_segments_v = 16;
+int mesh_type = 0; // 0 = Torus Knot, 1 = Classic Torus
+
+// Camera & Light Parameters
+float cam_yaw = 0.0f;
+float cam_pitch = 0.3f;
+float cam_dist = 5.2f;
+bool auto_rotate = true;
+Vec3 light_dir = Vec3(0.577f, 0.577f, 0.577f).normalize();
 
 int frame_counter = 0;
-float px = 160.0f, py = 150.0f;
-bool plasma_enabled = false;
-
-// 3D Starfield
-constexpr int MAX_STARS = 1000;
-struct Star3D { float x, y, z; };
-Star3D stars[MAX_STARS];
-
-// Additive Particle Stress System
-constexpr int MAX_PARTICLES = 2500;
-struct Particle {
-    float x, y, vx, vy;
-    uint32_t color;
-    int life, max_life;
-    bool active;
-};
-Particle particles[MAX_PARTICLES];
-int active_particle_target = 300; // Scalable stress level
-
-// Laser Bullets
-struct Bullet { float x, y; bool active; };
-Bullet bullets[16];
-
-// Audio State
-float sfx_pitch = 0.0f;
-float sfx_noise = 0.0f;
-float player_pan = 0.5f; // 0.0 (left) to 1.0 (right)
+int triangles_rendered = 0;
 
 // ==========================================
-// 3D WIREFRAME CUBE DATA
+// PROCEDURAL MESH GENERATORS
 // ==========================================
-struct Vec3 { float x, y, z; };
-const Vec3 CUBE_VERTS[8] = {
-    {-1, -1, -1}, { 1, -1, -1}, { 1,  1, -1}, {-1,  1, -1},
-    {-1, -1,  1}, { 1, -1,  1}, { 1,  1,  1}, {-1,  1,  1}
-};
-const int CUBE_EDGES[12][2] = {
-    {0,1}, {1,2}, {2,3}, {3,0},
-    {4,5}, {5,6}, {6,7}, {7,4},
-    {0,4}, {1,5}, {2,6}, {3,7}
-};
-float cube_rot_x = 0.0f;
-float cube_rot_y = 0.0f;
+void generate_mesh() {
+    mesh_vertices.clear();
+    mesh_triangles.clear();
 
-// ==========================================
-// GRAPHICS PRIMITIVES
-// ==========================================
-inline void put_pixel(int x, int y, uint32_t color) {
-    if (x >= 0 && x < game_w && y >= 0 && y < game_h) {
-        framebuffer[y * game_w + x] = color;
-    }
-}
+    int u_steps = mesh_segments_u;
+    int v_steps = mesh_segments_v;
 
-inline void put_pixel_add(int x, int y, uint32_t color) {
-    if (x >= 0 && x < game_w && y >= 0 && y < game_h) {
-        int idx = y * game_w + x;
-        framebuffer[idx] = blend_add(framebuffer[idx], color);
-    }
-}
+    for (int i = 0; i < u_steps; ++i) {
+        float u = (float)i / u_steps * (2.0f * PI);
 
-void draw_rect(int start_x, int start_y, int w, int h, uint32_t color) {
-    int x1 = std::max(0, start_x);
-    int y1 = std::max(0, start_y);
-    int x2 = std::min(game_w, start_x + w);
-    int y2 = std::min(game_h, start_y + h);
+        // Curve center and tangent
+        Vec3 p, p_next;
+        if (mesh_type == 0) {
+            // Torus Knot (p=2, q=3)
+            float r = 1.2f + 0.5f * std::cos(3.0f * u);
+            p = { r * std::cos(2.0f * u), r * std::sin(2.0f * u), 0.6f * std::sin(3.0f * u) };
+            
+            float u2 = u + 0.01f;
+            float r2 = 1.2f + 0.5f * std::cos(3.0f * u2);
+            p_next = { r2 * std::cos(2.0f * u2), r2 * std::sin(2.0f * u2), 0.6f * std::sin(3.0f * u2) };
+        } else {
+            // Standard Donut Torus
+            p = { 1.6f * std::cos(u), 1.6f * std::sin(u), 0.0f };
+            float u2 = u + 0.01f;
+            p_next = { 1.6f * std::cos(u2), 1.6f * std::sin(u2), 0.0f };
+        }
 
-    for (int y = y1; y < y2; ++y) {
-        int row = y * game_w;
-        for (int x = x1; x < x2; ++x) {
-            framebuffer[row + x] = color;
+        Vec3 T = (p_next - p).normalize();
+        Vec3 N = (mesh_type == 0) ? Vec3(std::cos(2.0f * u), std::sin(2.0f * u), 0.0f).normalize() : Vec3(0, 0, 1);
+        Vec3 B = T.cross(N).normalize();
+        N = B.cross(T).normalize();
+
+        float tube_radius = (mesh_type == 0) ? 0.28f : 0.6f;
+
+        for (int j = 0; j < v_steps; ++j) {
+            float v = (float)j / v_steps * (2.0f * PI);
+            float cx = std::cos(v) * tube_radius;
+            float cy = std::sin(v) * tube_radius;
+
+            Vertex vert;
+            vert.normal = (N * cx + B * cy).normalize();
+            vert.pos = p + vert.normal * tube_radius;
+            mesh_vertices.push_back(vert);
         }
     }
+
+    // Build Index Triangles
+    for (int i = 0; i < u_steps; ++i) {
+        int i_next = (i + 1) % u_steps;
+        for (int j = 0; j < v_steps; ++j) {
+            int j_next = (j + 1) % v_steps;
+
+            int idx0 = i * v_steps + j;
+            int idx1 = i_next * v_steps + j;
+            int idx2 = i_next * v_steps + j_next;
+            int idx3 = i * v_steps + j_next;
+
+            // Two triangles per quad
+            mesh_triangles.push_back({idx0, idx1, idx2, {}});
+            mesh_triangles.push_back({idx0, idx2, idx3, {}});
+        }
+    }
+
+    // Compute Face Normals
+    for (auto& tri : mesh_triangles) {
+        Vec3 v0 = mesh_vertices[tri.v0].pos;
+        Vec3 v1 = mesh_vertices[tri.v1].pos;
+        Vec3 v2 = mesh_vertices[tri.v2].pos;
+        tri.face_normal = (v1 - v0).cross(v2 - v0).normalize();
+    }
 }
 
-void draw_line(int x0, int y0, int x1, int y1, uint32_t color) {
+// ==========================================
+// TRIANGLE SCANLINE RASTERIZER
+// ==========================================
+void draw_line_raw(int x0, int y0, int x1, int y1, uint32_t color) {
     int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
     int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
     int err = dx + dy;
     while (true) {
-        put_pixel(x0, y0, color);
+        if (x0 >= 0 && x0 < game_w && y0 >= 0 && y0 < game_h) {
+            framebuffer[y0 * game_w + x0] = color;
+        }
         if (x0 == x1 && y0 == y1) break;
         int e2 = 2 * err;
         if (e2 >= dy) { err += dy; x0 += sx; }
@@ -143,49 +194,134 @@ void draw_line(int x0, int y0, int x1, int y1, uint32_t color) {
     }
 }
 
-void spawn_explosion(float x, float y, int count, uint32_t color) {
-    int spawned = 0;
-    for (int i = 0; i < MAX_PARTICLES && spawned < count; ++i) {
-        if (!particles[i].active) {
-            particles[i].active = true;
-            particles[i].x = x;
-            particles[i].y = y;
-            float angle = (float)(rand() % 628) / 100.0f;
-            float speed = ((rand() % 100) / 25.0f) + 1.0f;
-            particles[i].vx = std::cos(angle) * speed;
-            particles[i].vy = std::sin(angle) * speed;
-            particles[i].life = (rand() % 40) + 20;
-            particles[i].max_life = particles[i].life;
-            particles[i].color = color;
-            spawned++;
+// Edge walker for scanline fill
+struct Edge {
+    float x, dx_dy;
+    float inv_z, dinv_z_dy;
+    float light, dlight_dy;
+};
+
+void rasterize_triangle(const Vertex& v0, const Vertex& v1, const Vertex& v2, uint32_t base_color) {
+    // 1. Sort vertices by Y: p0.y <= p1.y <= p2.y
+    const Vertex* p0 = &v0;
+    const Vertex* p1 = &v1;
+    const Vertex* p2 = &v2;
+    if (p1->sy < p0->sy) std::swap(p0, p1);
+    if (p2->sy < p0->sy) std::swap(p0, p2);
+    if (p2->sy < p1->sy) std::swap(p1, p2);
+
+    int y_start = std::max(0, (int)std::ceil(p0->sy));
+    int y_end   = std::min(game_h - 1, (int)std::ceil(p2->sy) - 1);
+    if (y_start > y_end) return;
+
+    float total_height = p2->sy - p0->sy;
+    if (total_height < 0.001f) return;
+
+    // Cross product for left/right handedness
+    bool right_handed = ((p1->sx - p0->sx) * (p2->sy - p0->sy) - (p1->sy - p0->sy) * (p2->sx - p0->sx)) > 0;
+
+    for (int y = y_start; y <= y_end; ++y) {
+        bool second_half = y > p1->sy || p1->sy == p0->sy;
+        float segment_height = second_half ? (p2->sy - p1->sy) : (p1->sy - p0->sy);
+        if (segment_height < 0.001f) continue;
+
+        float alpha = (float)(y - p0->sy) / total_height;
+        float beta  = second_half ? (float)(y - p1->sy) / segment_height : (float)(y - p0->sy) / segment_height;
+
+        // Long Edge (p0 -> p2)
+        float x_long = p0->sx + (p2->sx - p0->sx) * alpha;
+        float z_long = p0->inv_z + (p2->inv_z - p0->inv_z) * alpha;
+        float l_long = p0->light + (p2->light - p0->light) * alpha;
+
+        // Split Edge (p0 -> p1 or p1 -> p2)
+        float x_short = second_half ? (p1->sx + (p2->sx - p1->sx) * beta) : (p0->sx + (p1->sx - p0->sx) * beta);
+        float z_short = second_half ? (p1->inv_z + (p2->inv_z - p1->inv_z) * beta) : (p0->inv_z + (p1->inv_z - p0->inv_z) * beta);
+        float l_short = second_half ? (p1->light + (p2->light - p1->light) * beta) : (p0->light + (p1->light - p0->light) * beta);
+
+        float xa = x_long, xb = x_short;
+        float za = z_long, zb = z_short;
+        float la = l_long, lb = l_short;
+
+        if (!right_handed) {
+            std::swap(xa, xb);
+            std::swap(za, zb);
+            std::swap(la, lb);
+        }
+
+        int x_min = std::max(0, (int)std::ceil(xa));
+        int x_max = std::min(game_w - 1, (int)std::ceil(xb) - 1);
+        float span = xb - xa;
+
+        if (span > 0.001f && x_min <= x_max) {
+            int row = y * game_w;
+            float dz_dx = (zb - za) / span;
+            float dl_dx = (lb - la) / span;
+
+            float x_prestep = (float)x_min - xa;
+            float z_cur = za + dz_dx * x_prestep;
+            float l_cur = la + dl_dx * x_prestep;
+
+            for (int x = x_min; x <= x_max; ++x) {
+                int idx = row + x;
+                // Inverse depth test (greater is closer)
+                if (z_cur > z_buffer[idx]) {
+                    z_buffer[idx] = z_cur;
+                    framebuffer[idx] = (current_mode == GOURAUD) ? 
+                                       shade_color(base_color, l_cur) : base_color;
+                }
+                z_cur += dz_dx;
+                l_cur += dl_dx;
+            }
         }
     }
 }
 
 // ==========================================
-// LIFECYCLE
+// AUDIO SYNTHESIZER (FM CHIPTUNE ARPEGGIO)
+// ==========================================
+const float NOTES[] = {
+    220.00f, 261.63f, 329.63f, 392.00f, 440.00f, 523.25f, 659.25f, 783.99f
+};
+int note_step = 0;
+float note_timer = 0.0f;
+
+void synth_audio() {
+    static float carrier_phase = 0.0f;
+    static float mod_phase = 0.0f;
+
+    float current_freq = NOTES[note_step];
+    note_timer += (float)AUDIO_FRAMES_PER_TICK / SAMPLE_RATE;
+    if (note_timer >= 0.12f) { // 120ms arpeggio step
+        note_timer = 0.0f;
+        note_step = (note_step + 1) % 8;
+    }
+
+    for (int i = 0; i < AUDIO_FRAMES_PER_TICK; ++i) {
+        // Simple 2-operator FM synth
+        float mod = std::sin(mod_phase) * 1.5f;
+        float sample_f = std::sin(carrier_phase + mod) * 3500.0f;
+
+        int16_t sample = (int16_t)sample_f;
+        audio_buffer[i * 2 + 0] = sample;
+        audio_buffer[i * 2 + 1] = sample;
+
+        carrier_phase += (2.0f * PI * current_freq) / SAMPLE_RATE;
+        mod_phase += (2.0f * PI * (current_freq * 2.0f)) / SAMPLE_RATE;
+        if (carrier_phase > 100.0f) carrier_phase -= 100.0f;
+        if (mod_phase > 100.0f) mod_phase -= 100.0f;
+    }
+}
+
+// ==========================================
+// LIFECYCLE HOOKS
 // ==========================================
 extern "C" {
     WASM_EXPORT("init")
     void init() {
         set_screen_res(game_w, game_h);
-
-        // Init 3D Stars
-        for (int i = 0; i < MAX_STARS; ++i) {
-            stars[i].x = (float)((rand() % 2000) - 1000);
-            stars[i].y = (float)((rand() % 2000) - 1000);
-            stars[i].z = (float)((rand() % 1000) + 1);
-        }
-
-        // Init Particles
-        for (int i = 0; i < MAX_PARTICLES; ++i) {
-            particles[i].active = false;
-        }
-
-        // Init Bullets
-        for (int i = 0; i < 16; ++i) {
-            bullets[i].active = false;
-        }
+        generate_mesh();
+        printf("[3D RASTERIZER] Initialized. %zu Vertices, %zu Polygons\n",
+               mesh_vertices.size(), mesh_triangles.size());
     }
 
     WASM_EXPORT("update")
@@ -194,248 +330,152 @@ extern "C" {
         uint32_t pressed = get_btn_pressed();
         uint32_t just_pressed = get_btn_just_pressed();
 
-        // 1. Resolution Switching
+        // 1. Resolution Selection
         if (just_pressed & BTN_X) {
             current_res_idx = (current_res_idx + 1) % NUM_RESOLUTIONS;
             game_w = RESOLUTIONS[current_res_idx].w;
             game_h = RESOLUTIONS[current_res_idx].h;
             set_screen_res(game_w, game_h);
+            printf("[3D] Mode: %s (%'d Pixels)\n", RESOLUTIONS[current_res_idx].name, game_w * game_h);
         }
         if (just_pressed & BTN_Y) {
             current_res_idx = (current_res_idx - 1 + NUM_RESOLUTIONS) % NUM_RESOLUTIONS;
             game_w = RESOLUTIONS[current_res_idx].w;
             game_h = RESOLUTIONS[current_res_idx].h;
             set_screen_res(game_w, game_h);
+            printf("[3D] Mode: %s (%'d Pixels)\n", RESOLUTIONS[current_res_idx].name, game_w * game_h);
         }
 
-        // 2. Stress Load Adjustment
-        if (just_pressed & BTN_R) { // Increase Load
-            active_particle_target = std::min(active_particle_target + 250, MAX_PARTICLES);
+        // 2. Shading & Object Toggles
+        if (just_pressed & BTN_A) {
+            current_mode = (ShadingMode)((current_mode + 1) % MODE_COUNT);
+            const char* names[] = {"Gouraud", "Flat", "Normal Colors", "Wireframe"};
+            printf("[3D] Shading Mode: %s\n", names[current_mode]);
         }
-        if (just_pressed & BTN_L) { // Decrease Load
-            active_particle_target = std::max(active_particle_target - 250, 50);
-        }
-        if (just_pressed & BTN_B) { // Toggle Heavy Plasma
-            plasma_enabled = !plasma_enabled;
-        }
-
-        // 3. State & Game Logic
-        if (state == ATTRACT_MODE) {
-            if (just_pressed & BTN_START) {
-                state = PLAYING;
-                px = game_w * 0.5f;
-                py = game_h * 0.85f;
-                sfx_noise = 1.0f; // Roar sound on start
-            }
-        } 
-        else if (state == PLAYING) {
-            float speed = (game_w / 320.0f) * 3.5f; // Scale speed with resolution
-            if (pressed & BTN_LEFT)  px -= speed;
-            if (pressed & BTN_RIGHT) px += speed;
-            if (pressed & BTN_UP)    py -= speed;
-            if (pressed & BTN_DOWN)  py += speed;
-
-            px = std::max(20.0f, std::min((float)game_w - 20.0f, px));
-            py = std::max(20.0f, std::min((float)game_h - 20.0f, py));
-            player_pan = px / (float)game_w;
-
-            // Shoot
-            if (just_pressed & BTN_A) {
-                for (int i = 0; i < 16; ++i) {
-                    if (!bullets[i].active) {
-                        bullets[i].active = true;
-                        bullets[i].x = px;
-                        bullets[i].y = py - 12;
-                        sfx_pitch = 900.0f;
-                        spawn_explosion(px, py, 120, C_CYAN); // Additive particle burst
-                        break;
-                    }
-                }
-            }
+        if (just_pressed & BTN_B) {
+            mesh_type = 1 - mesh_type;
+            generate_mesh();
+            printf("[3D] Mesh Changed: %s (%zu tris)\n", 
+                   mesh_type == 0 ? "Torus Knot" : "Classic Donut", mesh_triangles.size());
         }
 
-        // Update Bullets
-        for (int i = 0; i < 16; ++i) {
-            if (bullets[i].active) {
-                bullets[i].y -= (game_h / 180.0f) * 7.0f;
-                if (bullets[i].y < 0) bullets[i].active = false;
-            }
+        // 3. Tessellation Quality (Triangle Budget)
+        if (just_pressed & BTN_R) {
+            mesh_segments_u = std::min(mesh_segments_u + 12, 128);
+            mesh_segments_v = std::min(mesh_segments_v + 4, 32);
+            generate_mesh();
+            printf("[3D] Increased Tessellation: %zu triangles\n", mesh_triangles.size());
+        }
+        if (just_pressed & BTN_L) {
+            mesh_segments_u = std::max(mesh_segments_u - 12, 12);
+            mesh_segments_v = std::max(mesh_segments_v - 4, 6);
+            generate_mesh();
+            printf("[3D] Decreased Tessellation: %zu triangles\n", mesh_triangles.size());
         }
 
-        // 4. Update 3D Starfield
-        for (int i = 0; i < MAX_STARS; ++i) {
-            stars[i].z -= 12.0f;
-            if (stars[i].z <= 1.0f) {
-                stars[i].z = 1000.0f;
-                stars[i].x = (float)((rand() % 2000) - 1000);
-                stars[i].y = (float)((rand() % 2000) - 1000);
-            }
-        }
+        // 4. Camera Orbit Controls
+        if (just_pressed & BTN_START) auto_rotate = !auto_rotate;
 
-        // 5. Update Ambient Stress Particles
-        int active_count = 0;
-        for (int i = 0; i < MAX_PARTICLES; ++i) {
-            if (particles[i].active) {
-                particles[i].x += particles[i].vx;
-                particles[i].y += particles[i].vy;
-                particles[i].life--;
-                if (particles[i].life <= 0) particles[i].active = false;
-                else active_count++;
-            }
-        }
-        // Continuous particle emitter to keep stress high
-        if (active_count < active_particle_target) {
-            spawn_explosion((float)(rand() % game_w), (float)(rand() % (game_h / 2)), 
-                            std::min(25, active_particle_target - active_count), 
-                            (rand() % 2 == 0) ? C_MAGENTA : C_YELLOW);
-        }
+        if (auto_rotate) cam_yaw += 0.02f;
+        if (pressed & BTN_LEFT)  cam_yaw -= 0.04f;
+        if (pressed & BTN_RIGHT) cam_yaw += 0.04f;
+        if (pressed & BTN_UP)    cam_pitch = std::min(cam_pitch + 0.03f, 1.4f);
+        if (pressed & BTN_DOWN)  cam_pitch = std::max(cam_pitch - 0.03f, -1.4f);
 
-        // 6. Update 3D Cube Rotation
-        cube_rot_x += 0.02f;
-        cube_rot_y += 0.035f;
-
-        // 7. Stereo Synthesizer Engine
-        static float phase = 0.0f;
-        for (int i = 0; i < AUDIO_FRAMES_PER_TICK; ++i) {
-            int16_t mono = 0;
-            // Background Engine Hum
-            float hum = (state == PLAYING) ? 55.0f : 45.0f;
-            mono += (int16_t)(std::sin(phase * hum) * 1200.0f);
-
-            // Laser Sine Sweep
-            if (sfx_pitch > 50.0f) {
-                mono += (int16_t)(std::sin(phase * sfx_pitch) * 3500.0f);
-                sfx_pitch -= 0.8f;
-            }
-
-            // White Noise Burst
-            if (sfx_noise > 0.01f) {
-                mono += (int16_t)(((rand() % 2000) - 1000) * sfx_noise * 3.0f);
-                sfx_noise *= 0.999f;
-            }
-
-            // Pan audio between left and right ears
-            audio_buffer[i * 2 + 0] = (int16_t)(mono * (1.0f - player_pan)); // Left
-            audio_buffer[i * 2 + 1] = (int16_t)(mono * player_pan);          // Right
-
-            phase += (2.0f * 3.14159f) / SAMPLE_RATE;
-            if (phase > 100.0f) phase -= 100.0f;
-        }
+        // 5. Synthesize Audio Frame
+        synth_audio();
     }
 
     WASM_EXPORT("draw")
     void draw() {
-        // ==========================================
-        // 1. BACKGROUND (FAST CLEAR OR HEAVY PLASMA)
-        // ==========================================
-        if (plasma_enabled) {
-            // Per-pixel trig plasma stress test across current resolution
-            float t = frame_counter * 0.05f;
-            for (int y = 0; y < game_h; ++y) {
-                int row = y * game_w;
-                float fy = (float)y * 0.03f;
-                for (int x = 0; x < game_w; ++x) {
-                    float fx = (float)x * 0.03f;
-                    float v = std::sin(fx + t) + std::sin(fy + t) + std::sin((fx + fy) + t);
-                    uint8_t c = (uint8_t)((v + 3.0f) * 28.0f);
-                    framebuffer[row + x] = 0xFF000000 | (c << 16) | (c / 2 << 8) | (c / 4);
-                }
-            }
-        } else {
-            // Raw Fast Screen Clear
-            std::fill_n(framebuffer, game_w * game_h, C_BLACK);
-        }
+        auto t_start = std::chrono::high_resolution_clock::now();
 
-        // ==========================================
-        // 2. 3D PERSPECTIVE STARFIELD
-        // ==========================================
+        // 1. Clear Screen & Depth Buffer (WASM memory optimized)
+        std::fill_n(framebuffer, game_w * game_h, rgb(16, 20, 32));
+        std::fill_n(z_buffer, game_w * game_h, 0.0f); // 0.0 is far plane for 1/z
+
+        // 2. Camera View Matrix Transform
+        float cos_y = std::cos(cam_yaw), sin_y = std::sin(cam_yaw);
+        float cos_p = std::cos(cam_pitch), sin_p = std::sin(cam_pitch);
+
+        Vec3 cam_pos = {
+            cam_dist * cos_p * sin_y,
+            cam_dist * sin_p,
+            cam_dist * cos_p * cos_y
+        };
+
+        // Forward, Right, Up coordinate frame
+        Vec3 forward = (Vec3(0, 0, 0) - cam_pos).normalize();
+        Vec3 right = forward.cross(Vec3(0, 1, 0)).normalize();
+        Vec3 up = right.cross(forward).normalize();
+
+        float fov = game_h * 1.15f;
         float cx = game_w * 0.5f;
         float cy = game_h * 0.5f;
-        float fov = game_w * 0.6f;
 
-        for (int i = 0; i < MAX_STARS; ++i) {
-            float inv_z = 1.0f / stars[i].z;
-            int sx = (int)(cx + stars[i].x * inv_z * fov);
-            int sy = (int)(cy + stars[i].y * inv_z * fov);
+        // 3. Transform & Light Vertices
+        for (auto& v : mesh_vertices) {
+            Vec3 p = v.pos - cam_pos;
+            v.view_pos = { p.dot(right), p.dot(up), p.dot(forward) };
 
-            if (sx >= 0 && sx < game_w && sy >= 0 && sy < game_h) {
-                uint32_t col = (stars[i].z < 400.0f) ? C_WHITE : 
-                              ((stars[i].z < 700.0f) ? C_CYAN : 0xFF555555);
-                put_pixel(sx, sy, col);
+            if (v.view_pos.z > 0.1f) {
+                v.inv_z = 1.0f / v.view_pos.z;
+                v.sx = cx + (v.view_pos.x * v.inv_z) * fov;
+                v.sy = cy - (v.view_pos.y * v.inv_z) * fov; // Invert Y for screen coordinates
+
+                // Diffuse + Specular Lighting Calculation
+                float diffuse = std::max(0.0f, v.normal.dot(light_dir));
+                Vec3 view_dir = (cam_pos - v.pos).normalize();
+                Vec3 half_vec = (light_dir + view_dir).normalize();
+                float specular = std::pow(std::max(0.0f, v.normal.dot(half_vec)), 16.0f);
+
+                v.light = 0.20f + (diffuse * 0.70f) + (specular * 0.40f);
             }
         }
 
-        // ==========================================
-        // 3. 3D ROTATING WIREFRAME CUBE
-        // ==========================================
-        Vec3 proj_verts[8];
-        float cos_x = std::cos(cube_rot_x), sin_x = std::sin(cube_rot_x);
-        float cos_y = std::cos(cube_rot_y), sin_y = std::sin(cube_rot_y);
-        float cube_scale = game_h * 0.15f;
+        // 4. Render Triangles with Backface Culling
+        triangles_rendered = 0;
+        uint32_t base_color = (mesh_type == 0) ? rgb(240, 90, 40) : rgb(40, 180, 240);
 
-        for (int i = 0; i < 8; ++i) {
-            // Y rotation
-            float x1 = CUBE_VERTS[i].x * cos_y + CUBE_VERTS[i].z * sin_y;
-            float z1 = -CUBE_VERTS[i].x * sin_y + CUBE_VERTS[i].z * cos_y;
-            // X rotation
-            float y2 = CUBE_VERTS[i].y * cos_x - z1 * sin_x;
-            float z2 = CUBE_VERTS[i].y * sin_x + z1 * cos_x + 3.5f;
+        for (const auto& tri : mesh_triangles) {
+            const Vertex& v0 = mesh_vertices[tri.v0];
+            const Vertex& v1 = mesh_vertices[tri.v1];
+            const Vertex& v2 = mesh_vertices[tri.v2];
 
-            // Perspective Projection
-            proj_verts[i].x = cx + (x1 / z2) * cube_scale * 3.0f;
-            proj_verts[i].y = cy + (y2 / z2) * cube_scale * 3.0f;
-        }
+            // Near-plane clipping guard
+            if (v0.view_pos.z <= 0.1f || v1.view_pos.z <= 0.1f || v2.view_pos.z <= 0.1f) continue;
 
-        for (int i = 0; i < 12; ++i) {
-            const auto& p1 = proj_verts[CUBE_EDGES[i][0]];
-            const auto& p2 = proj_verts[CUBE_EDGES[i][1]];
-            draw_line((int)p1.x, (int)p1.y, (int)p2.x, (int)p2.y, C_BLUE);
-        }
+            // Screen-space 2D Cross Product (Exact Backface Culling)
+            float cross2d = (v1.sx - v0.sx) * (v2.sy - v0.sy) - (v1.sy - v0.sy) * (v2.sx - v0.sx);
+            if (cross2d <= 0.0f) continue; // Face points away from camera!
 
-        // ==========================================
-        // 4. ADDITIVE GLOW PARTICLES (STRESS TEST)
-        // ==========================================
-        for (int i = 0; i < MAX_PARTICLES; ++i) {
-            if (particles[i].active) {
-                int px_pos = (int)particles[i].x;
-                int py_pos = (int)particles[i].y;
-                // Additive 3x3 glowing core
-                put_pixel_add(px_pos, py_pos, particles[i].color);
-                put_pixel_add(px_pos - 1, py_pos, 0xFF442222);
-                put_pixel_add(px_pos + 1, py_pos, 0xFF442222);
-                put_pixel_add(px_pos, py_pos - 1, 0xFF442222);
-                put_pixel_add(px_pos, py_pos + 1, 0xFF442222);
+            triangles_rendered++;
+
+            if (current_mode == WIREFRAME) {
+                uint32_t green = rgb(50, 255, 100);
+                draw_line_raw((int)v0.sx, (int)v0.sy, (int)v1.sx, (int)v1.sy, green);
+                draw_line_raw((int)v1.sx, (int)v1.sy, (int)v2.sx, (int)v2.sy, green);
+                draw_line_raw((int)v2.sx, (int)v2.sy, (int)v0.sx, (int)v0.sy, green);
+            } else if (current_mode == NORMALS) {
+                // Visualize face normal as RGB color
+                uint32_t n_col = rgb((uint8_t)((tri.face_normal.x * 0.5f + 0.5f) * 255),
+                                     (uint8_t)((tri.face_normal.y * 0.5f + 0.5f) * 255),
+                                     (uint8_t)((tri.face_normal.z * 0.5f + 0.5f) * 255));
+                rasterize_triangle(v0, v1, v2, n_col);
+            } else if (current_mode == FLAT) {
+                float diff = std::max(0.15f, tri.face_normal.dot(light_dir));
+                rasterize_triangle(v0, v1, v2, shade_color(base_color, diff));
+            } else { // GOURAUD
+                rasterize_triangle(v0, v1, v2, base_color);
             }
         }
 
-        // ==========================================
-        // 5. BULLETS & PLAYER SHIP
-        // ==========================================
-        for (int i = 0; i < 16; ++i) {
-            if (bullets[i].active) {
-                draw_rect((int)bullets[i].x - 1, (int)bullets[i].y, 3, 10, C_YELLOW);
-            }
+        // 5. Telemetry & Microsecond Budget Profiler
+        auto t_end = std::chrono::high_resolution_clock::now();
+        auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
+        if (frame_counter % 120 == 0) {
+            printf("[3D PROFILER] %zu Tris | Rasterized: %d | Time: %4lld µs / 16,666 µs (%2.1f%% budget)\n",
+                   mesh_triangles.size(), triangles_rendered, duration_us, (duration_us / 16666.0f) * 100.0f);
         }
-
-        if (state == PLAYING) {
-            int scale = std::max(1, game_w / 320);
-            draw_rect((int)px - (6 * scale), (int)py + (4 * scale), 12 * scale, 4 * scale, C_BLUE);
-            draw_rect((int)px - (2 * scale), (int)py - (4 * scale), 4 * scale, 12 * scale, C_GREEN);
-            draw_rect((int)px - (1 * scale), (int)py - (6 * scale), 2 * scale, 2 * scale, C_RED);
-        } else {
-            // Blinking Title Indicator
-            if ((frame_counter / 30) % 2 == 0) {
-                int banner_w = game_w * 0.4f;
-                int banner_h = 24;
-                draw_rect(cx - (banner_w / 2), cy + (game_h * 0.25f), banner_w, banner_h, C_RED);
-            }
-        }
-
-        // ==========================================
-        // 6. ON-SCREEN HUD (RESOLUTION & LOAD MONITOR)
-        // ==========================================
-        // Lower stress-indicator bar
-        int bar_width = (int)(((float)active_particle_target / MAX_PARTICLES) * (game_w - 20));
-        draw_rect(10, game_h - 6, bar_width, 3, C_GREEN);
     }
 }
