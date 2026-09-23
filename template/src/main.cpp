@@ -32,11 +32,11 @@ struct Vec3 {
 
 struct Vertex {
     Vec3 pos;       // Model space
-    Vec3 normal;    // Normal
+    Vec3 normal;    // World/Model normal
     Vec3 view_pos;  // Camera view space
     float sx, sy;   // Screen coords
     float inv_z;    // 1 / Z for depth interpolation
-    float light;    // Calculated vertex lighting intensity
+    float light;    // For Gouraud
 };
 
 struct Triangle {
@@ -81,8 +81,8 @@ int game_w = 640;
 int game_h = 360;
 
 // Shading Modes
-enum ShadingMode { GOURAUD = 0, FLAT, NORMALS, WIREFRAME, MODE_COUNT };
-ShadingMode current_mode = GOURAUD;
+enum ShadingMode { BLINN_PHONG = 0, GOURAUD, FLAT, NORMALS, WIREFRAME, MODE_COUNT };
+ShadingMode current_mode = BLINN_PHONG;
 
 // Geometry Mesh Data
 std::vector<Vertex> mesh_vertices;
@@ -91,12 +91,14 @@ int mesh_segments_u = 48;
 int mesh_segments_v = 16;
 int mesh_type = 0; // 0 = Torus Knot, 1 = Classic Torus
 
-// Camera & Light Parameters
+// Camera & Lighting Parameters
 float cam_yaw = 0.0f;
 float cam_pitch = 0.3f;
 float cam_dist = 5.2f;
 bool auto_rotate = true;
+
 Vec3 light_dir = Vec3(0.577f, 0.577f, 0.577f).normalize();
+Vec3 half_vec; // Blinn Half-Vector (H = normalize(L + V))
 
 int frame_counter = 0;
 int triangles_rendered = 0;
@@ -114,7 +116,6 @@ void generate_mesh() {
     for (int i = 0; i < u_steps; ++i) {
         float u = (float)i / u_steps * (2.0f * PI);
 
-        // Curve center and tangent
         Vec3 p, p_next;
         if (mesh_type == 0) {
             // Torus Knot (p=2, q=3)
@@ -150,7 +151,6 @@ void generate_mesh() {
         }
     }
 
-    // Build Index Triangles
     for (int i = 0; i < u_steps; ++i) {
         int i_next = (i + 1) % u_steps;
         for (int j = 0; j < v_steps; ++j) {
@@ -161,13 +161,11 @@ void generate_mesh() {
             int idx2 = i_next * v_steps + j_next;
             int idx3 = i * v_steps + j_next;
 
-            // Two triangles per quad
             mesh_triangles.push_back({idx0, idx1, idx2, {}});
             mesh_triangles.push_back({idx0, idx2, idx3, {}});
         }
     }
 
-    // Compute Face Normals
     for (auto& tri : mesh_triangles) {
         Vec3 v0 = mesh_vertices[tri.v0].pos;
         Vec3 v1 = mesh_vertices[tri.v1].pos;
@@ -177,7 +175,7 @@ void generate_mesh() {
 }
 
 // ==========================================
-// TRIANGLE SCANLINE RASTERIZER
+// TRIANGLE SCANLINE RASTERIZER (BLINN-PHONG ENABLED)
 // ==========================================
 void draw_line_raw(int x0, int y0, int x1, int y1, uint32_t color) {
     int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
@@ -193,13 +191,6 @@ void draw_line_raw(int x0, int y0, int x1, int y1, uint32_t color) {
         if (e2 <= dx) { err += dx; y0 += sy; }
     }
 }
-
-// Edge walker for scanline fill
-struct Edge {
-    float x, dx_dy;
-    float inv_z, dinv_z_dy;
-    float light, dlight_dy;
-};
 
 void rasterize_triangle(const Vertex& v0, const Vertex& v1, const Vertex& v2, uint32_t base_color) {
     // 1. Sort vertices by Y: p0.y <= p1.y <= p2.y
@@ -217,7 +208,6 @@ void rasterize_triangle(const Vertex& v0, const Vertex& v1, const Vertex& v2, ui
     float total_height = p2->sy - p0->sy;
     if (total_height < 0.001f) return;
 
-    // Cross product for left/right handedness
     bool right_handed = ((p1->sx - p0->sx) * (p2->sy - p0->sy) - (p1->sy - p0->sy) * (p2->sx - p0->sx)) > 0;
 
     for (int y = y_start; y <= y_end; ++y) {
@@ -232,20 +222,28 @@ void rasterize_triangle(const Vertex& v0, const Vertex& v1, const Vertex& v2, ui
         float x_long = p0->sx + (p2->sx - p0->sx) * alpha;
         float z_long = p0->inv_z + (p2->inv_z - p0->inv_z) * alpha;
         float l_long = p0->light + (p2->light - p0->light) * alpha;
+        float nx_long = p0->normal.x + (p2->normal.x - p0->normal.x) * alpha;
+        float ny_long = p0->normal.y + (p2->normal.y - p0->normal.y) * alpha;
+        float nz_long = p0->normal.z + (p2->normal.z - p0->normal.z) * alpha;
 
         // Split Edge (p0 -> p1 or p1 -> p2)
         float x_short = second_half ? (p1->sx + (p2->sx - p1->sx) * beta) : (p0->sx + (p1->sx - p0->sx) * beta);
         float z_short = second_half ? (p1->inv_z + (p2->inv_z - p1->inv_z) * beta) : (p0->inv_z + (p1->inv_z - p0->inv_z) * beta);
         float l_short = second_half ? (p1->light + (p2->light - p1->light) * beta) : (p0->light + (p1->light - p0->light) * beta);
+        float nx_short = second_half ? (p1->normal.x + (p2->normal.x - p1->normal.x) * beta) : (p0->normal.x + (p1->normal.x - p0->normal.x) * beta);
+        float ny_short = second_half ? (p1->normal.y + (p2->normal.y - p1->normal.y) * beta) : (p0->normal.y + (p1->normal.y - p0->normal.y) * beta);
+        float nz_short = second_half ? (p1->normal.z + (p2->normal.z - p1->normal.z) * beta) : (p0->normal.z + (p1->normal.z - p0->normal.z) * beta);
 
         float xa = x_long, xb = x_short;
         float za = z_long, zb = z_short;
         float la = l_long, lb = l_short;
+        float nxa = nx_long, nxb = nx_short;
+        float nya = ny_long, nyb = ny_short;
+        float nza = nz_long, nzb = nz_short;
 
         if (!right_handed) {
-            std::swap(xa, xb);
-            std::swap(za, zb);
-            std::swap(la, lb);
+            std::swap(xa, xb); std::swap(za, zb); std::swap(la, lb);
+            std::swap(nxa, nxb); std::swap(nya, nyb); std::swap(nza, nzb);
         }
 
         int x_min = std::max(0, (int)std::ceil(xa));
@@ -254,23 +252,71 @@ void rasterize_triangle(const Vertex& v0, const Vertex& v1, const Vertex& v2, ui
 
         if (span > 0.001f && x_min <= x_max) {
             int row = y * game_w;
-            float dz_dx = (zb - za) / span;
-            float dl_dx = (lb - la) / span;
+            float inv_span = 1.0f / span;
 
-            float x_prestep = (float)x_min - xa;
-            float z_cur = za + dz_dx * x_prestep;
-            float l_cur = la + dl_dx * x_prestep;
+            float dz_dx = (zb - za) * inv_span;
+            float dl_dx = (lb - la) * inv_span;
+            float dnx_dx = (nxb - nxa) * inv_span;
+            float dny_dx = (nyb - nya) * inv_span;
+            float dnz_dx = (nzb - nza) * inv_span;
+
+            float prestep = (float)x_min - xa;
+            float z_cur = za + dz_dx * prestep;
+            float l_cur = la + dl_dx * prestep;
+            float nx_cur = nxa + dnx_dx * prestep;
+            float ny_cur = nya + dny_dx * prestep;
+            float nz_cur = nza + dnz_dx * prestep;
 
             for (int x = x_min; x <= x_max; ++x) {
                 int idx = row + x;
-                // Inverse depth test (greater is closer)
                 if (z_cur > z_buffer[idx]) {
                     z_buffer[idx] = z_cur;
-                    framebuffer[idx] = (current_mode == GOURAUD) ? 
-                                       shade_color(base_color, l_cur) : base_color;
+
+                    if (current_mode == BLINN_PHONG) {
+                        // 1. Normalize interpolated surface normal
+                        float inv_len = 1.0f / std::sqrt(nx_cur * nx_cur + ny_cur * ny_cur + nz_cur * nz_cur);
+                        float nnx = nx_cur * inv_len;
+                        float nny = ny_cur * inv_len;
+                        float nnz = nz_cur * inv_len;
+
+                        // 2. Diffuse = max(0, N . L)
+                        float ndotl = nnx * light_dir.x + nny * light_dir.y + nnz * light_dir.z;
+                        float diff = std::max(0.0f, ndotl);
+
+                        // 3. Blinn Specular = max(0, N . H)^32
+                        float ndoth = nnx * half_vec.x + nny * half_vec.y + nnz * half_vec.z;
+                        float spec = 0.0f;
+                        if (ndoth > 0.0f) {
+                            // Fast 5-multiplication exponent: x^32 = (((((x)^2)^2)^2)^2)^2
+                            float s2 = ndoth * ndoth;
+                            float s4 = s2 * s2;
+                            float s8 = s4 * s4;
+                            float s16 = s8 * s8;
+                            spec = s16 * s16;
+                        }
+
+                        // 4. Combine: Ambient + Diffuse (base color) + Specular (crisp white highlight)
+                        float light_intensity = 0.18f + diff * 0.75f;
+                        uint32_t r = (uint32_t)((base_color & 0xFF) * light_intensity + spec * 255.0f);
+                        uint32_t g = (uint32_t)(((base_color >> 8) & 0xFF) * light_intensity + spec * 255.0f);
+                        uint32_t b = (uint32_t)(((base_color >> 16) & 0xFF) * light_intensity + spec * 255.0f);
+
+                        framebuffer[idx] = 0xFF000000 | 
+                                           (std::min(255u, b) << 16) | 
+                                           (std::min(255u, g) << 8) | 
+                                           std::min(255u, r);
+
+                    } else if (current_mode == GOURAUD) {
+                        framebuffer[idx] = shade_color(base_color, l_cur);
+                    } else {
+                        framebuffer[idx] = base_color;
+                    }
                 }
                 z_cur += dz_dx;
                 l_cur += dl_dx;
+                nx_cur += dnx_dx;
+                ny_cur += dny_dx;
+                nz_cur += dnz_dx;
             }
         }
     }
@@ -291,13 +337,12 @@ void synth_audio() {
 
     float current_freq = NOTES[note_step];
     note_timer += (float)AUDIO_FRAMES_PER_TICK / SAMPLE_RATE;
-    if (note_timer >= 0.12f) { // 120ms arpeggio step
+    if (note_timer >= 0.12f) {
         note_timer = 0.0f;
         note_step = (note_step + 1) % 8;
     }
 
     for (int i = 0; i < AUDIO_FRAMES_PER_TICK; ++i) {
-        // Simple 2-operator FM synth
         float mod = std::sin(mod_phase) * 1.5f;
         float sample_f = std::sin(carrier_phase + mod) * 3500.0f;
 
@@ -346,12 +391,20 @@ extern "C" {
             printf("[3D] Mode: %s (%'d Pixels)\n", RESOLUTIONS[current_res_idx].name, game_w * game_h);
         }
 
-        // 2. Shading & Object Toggles
+        // 2. Shading Mode Cycle
         if (just_pressed & BTN_A) {
             current_mode = (ShadingMode)((current_mode + 1) % MODE_COUNT);
-            const char* names[] = {"Gouraud", "Flat", "Normal Colors", "Wireframe"};
-            printf("[3D] Shading Mode: %s\n", names[current_mode]);
+            const char* names[] = {
+                "Blinn-Phong (Per-Pixel Highlight)", 
+                "Gouraud (Smooth Vertex)", 
+                "Flat (Faceted)", 
+                "Normal Vectors", 
+                "Wireframe"
+            };
+            printf("[3D] Active Shader: %s\n", names[current_mode]);
         }
+
+        // 3. Object Type
         if (just_pressed & BTN_B) {
             mesh_type = 1 - mesh_type;
             generate_mesh();
@@ -359,21 +412,21 @@ extern "C" {
                    mesh_type == 0 ? "Torus Knot" : "Classic Donut", mesh_triangles.size());
         }
 
-        // 3. Tessellation Quality (Triangle Budget)
+        // 4. Tessellation Quality
         if (just_pressed & BTN_R) {
             mesh_segments_u = std::min(mesh_segments_u + 12, 128);
             mesh_segments_v = std::min(mesh_segments_v + 4, 32);
             generate_mesh();
-            printf("[3D] Increased Tessellation: %zu triangles\n", mesh_triangles.size());
+            printf("[3D] Tessellation raised: %zu triangles\n", mesh_triangles.size());
         }
         if (just_pressed & BTN_L) {
             mesh_segments_u = std::max(mesh_segments_u - 12, 12);
             mesh_segments_v = std::max(mesh_segments_v - 4, 6);
             generate_mesh();
-            printf("[3D] Decreased Tessellation: %zu triangles\n", mesh_triangles.size());
+            printf("[3D] Tessellation lowered: %zu triangles\n", mesh_triangles.size());
         }
 
-        // 4. Camera Orbit Controls
+        // 5. Camera Orbit
         if (just_pressed & BTN_START) auto_rotate = !auto_rotate;
 
         if (auto_rotate) cam_yaw += 0.02f;
@@ -382,7 +435,6 @@ extern "C" {
         if (pressed & BTN_UP)    cam_pitch = std::min(cam_pitch + 0.03f, 1.4f);
         if (pressed & BTN_DOWN)  cam_pitch = std::max(cam_pitch - 0.03f, -1.4f);
 
-        // 5. Synthesize Audio Frame
         synth_audio();
     }
 
@@ -390,11 +442,11 @@ extern "C" {
     void draw() {
         auto t_start = std::chrono::high_resolution_clock::now();
 
-        // 1. Clear Screen & Depth Buffer (WASM memory optimized)
+        // 1. Clear Screen & Depth Buffer
         std::fill_n(framebuffer, game_w * game_h, rgb(16, 20, 32));
-        std::fill_n(z_buffer, game_w * game_h, 0.0f); // 0.0 is far plane for 1/z
+        std::fill_n(z_buffer, game_w * game_h, 0.0f);
 
-        // 2. Camera View Matrix Transform
+        // 2. Camera Frame
         float cos_y = std::cos(cam_yaw), sin_y = std::sin(cam_yaw);
         float cos_p = std::cos(cam_pitch), sin_p = std::sin(cam_pitch);
 
@@ -404,16 +456,19 @@ extern "C" {
             cam_dist * cos_p * cos_y
         };
 
-        // Forward, Right, Up coordinate frame
         Vec3 forward = (Vec3(0, 0, 0) - cam_pos).normalize();
         Vec3 right = forward.cross(Vec3(0, 1, 0)).normalize();
         Vec3 up = right.cross(forward).normalize();
+
+        // 3. Compute Frame-Wide Blinn Half-Vector: H = normalize(L + V)
+        Vec3 view_dir = (cam_pos).normalize();
+        half_vec = (light_dir + view_dir).normalize();
 
         float fov = game_h * 1.15f;
         float cx = game_w * 0.5f;
         float cy = game_h * 0.5f;
 
-        // 3. Transform & Light Vertices
+        // 4. Transform & Lighting
         for (auto& v : mesh_vertices) {
             Vec3 p = v.pos - cam_pos;
             v.view_pos = { p.dot(right), p.dot(up), p.dot(forward) };
@@ -421,33 +476,28 @@ extern "C" {
             if (v.view_pos.z > 0.1f) {
                 v.inv_z = 1.0f / v.view_pos.z;
                 v.sx = cx + (v.view_pos.x * v.inv_z) * fov;
-                v.sy = cy - (v.view_pos.y * v.inv_z) * fov; // Invert Y for screen coordinates
+                v.sy = cy - (v.view_pos.y * v.inv_z) * fov;
 
-                // Diffuse + Specular Lighting Calculation
-                float diffuse = std::max(0.0f, v.normal.dot(light_dir));
-                Vec3 view_dir = (cam_pos - v.pos).normalize();
-                Vec3 half_vec = (light_dir + view_dir).normalize();
-                float specular = std::pow(std::max(0.0f, v.normal.dot(half_vec)), 16.0f);
-
-                v.light = 0.20f + (diffuse * 0.70f) + (specular * 0.40f);
+                // Diffuse lighting for Gouraud mode fallback
+                float diff = std::max(0.0f, v.normal.dot(light_dir));
+                v.light = 0.18f + diff * 0.82f;
             }
         }
 
-        // 4. Render Triangles with Backface Culling
+        // 5. Rasterize Triangles
         triangles_rendered = 0;
-        uint32_t base_color = (mesh_type == 0) ? rgb(240, 90, 40) : rgb(40, 180, 240);
+        uint32_t base_color = (mesh_type == 0) ? rgb(240, 80, 40) : rgb(40, 160, 240);
 
         for (const auto& tri : mesh_triangles) {
             const Vertex& v0 = mesh_vertices[tri.v0];
             const Vertex& v1 = mesh_vertices[tri.v1];
             const Vertex& v2 = mesh_vertices[tri.v2];
 
-            // Near-plane clipping guard
             if (v0.view_pos.z <= 0.1f || v1.view_pos.z <= 0.1f || v2.view_pos.z <= 0.1f) continue;
 
-            // Screen-space 2D Cross Product (Exact Backface Culling)
+            // Screen-space Backface Culling
             float cross2d = (v1.sx - v0.sx) * (v2.sy - v0.sy) - (v1.sy - v0.sy) * (v2.sx - v0.sx);
-            if (cross2d <= 0.0f) continue; // Face points away from camera!
+            if (cross2d <= 0.0f) continue;
 
             triangles_rendered++;
 
@@ -457,7 +507,6 @@ extern "C" {
                 draw_line_raw((int)v1.sx, (int)v1.sy, (int)v2.sx, (int)v2.sy, green);
                 draw_line_raw((int)v2.sx, (int)v2.sy, (int)v0.sx, (int)v0.sy, green);
             } else if (current_mode == NORMALS) {
-                // Visualize face normal as RGB color
                 uint32_t n_col = rgb((uint8_t)((tri.face_normal.x * 0.5f + 0.5f) * 255),
                                      (uint8_t)((tri.face_normal.y * 0.5f + 0.5f) * 255),
                                      (uint8_t)((tri.face_normal.z * 0.5f + 0.5f) * 255));
@@ -465,12 +514,12 @@ extern "C" {
             } else if (current_mode == FLAT) {
                 float diff = std::max(0.15f, tri.face_normal.dot(light_dir));
                 rasterize_triangle(v0, v1, v2, shade_color(base_color, diff));
-            } else { // GOURAUD
+            } else { // BLINN_PHONG or GOURAUD
                 rasterize_triangle(v0, v1, v2, base_color);
             }
         }
 
-        // 5. Telemetry & Microsecond Budget Profiler
+        // 6. Profiling Telemetry
         auto t_end = std::chrono::high_resolution_clock::now();
         auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
         if (frame_counter % 120 == 0) {
